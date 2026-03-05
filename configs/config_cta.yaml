@@ -23,7 +23,7 @@ gpu_id: "0"
 test_gpu_id: "0"
 cur_date: CL_3stage_interval_1_2_4  # 修改：标记课程学习版本
 model: MVIF-L/2
-tar_num_frames: 9  # 核心修改：从12改为9（支持间隔4采样3帧：0,4,8）
+tar_num_frames: 3  # 核心修改：从12改为9（支持间隔4采样3帧：0,4,8）
 image_size: 256
 diffusion_steps: 500   # sample_step
 learn_sigma: True # important
@@ -57,16 +57,27 @@ gradient_checkpointing: True
 # ========== 新增：课程学习相关参数 ==========
 # 阶段划分（训练步数）
 curriculum_learning:
-  stage1_steps: 1000      # 阶段1结束步数（间隔1）:20000
-  stage2_steps: 2000      # 阶段2结束步数（间隔2）:40000
-  # 阶段3从40k开始，直到max_train_steps
+  # 阶段切换点
+  stage1_steps: 1000
+  stage2_steps: 2000
+  
+  # 每个阶段的帧间距和密集帧数
+  stage1_frame_gap: 1
+  stage1_dense_frames: 3
+  
+  stage2_frame_gap: 2
+  stage2_dense_frames: 5
+  
+  stage3_frame_gap: 4
+  stage3_dense_frames: 9
+  
+  # 递归链配置
+  recursive_loss_weight: 0.2  # 降低权重减少计算
+  recursive_sampling_steps: 5  # 超快速采样（5步DDIM）
 
-  # 递归链loss权重
-  recursive_loss_weight: 0.3  # 递归链占总loss的权重
-
-  # 验证时各间隔的权重
+  # 新增：验证权重配置
   val_weights:
-    stage1: 
+    stage1:
       interval_1: 1.0
     stage2:
       interval_1: 0.3
@@ -75,9 +86,6 @@ curriculum_learning:
       interval_1: 0.1
       interval_2: 0.3
       interval_4: 0.6
-
-  # 密集帧相关
-  max_dense_frames: 9  # 密集帧数（必须能被最大间隔整除+1，如4*2+1=9）
 
 # 血管mask相关参数（保持原有）
 vessel_mask:

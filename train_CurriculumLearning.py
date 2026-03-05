@@ -273,150 +273,448 @@ def get_ema_decay(train_steps, base_decay=0.9999, min_decay=0.99, warmup_steps=1
         decay = base_decay
     return decay
 
-def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, val_fold, generate_vessel_mask_adaptive, raw_model, ema_model=None):
+def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, val_fold, 
+                                          generate_vessel_mask_adaptive, raw_model, 
+                                          current_step, stage1_steps, stage2_steps,
+                                          ema_model=None):
     """
-    保存单个样本的验证可视化图片（同时支持raw model和EMA model）
-    Args:
-        epoch: 当前epoch
-        video_val: 验证视频 [B, F, C, H, W]
-        vae: VAE模型
-        val_diffusion: 扩散模型
-        device: 设备
-        val_fold: 可视化保存目录
-        generate_vessel_mask_adaptive: 血管mask生成函数
-        raw_model: 原始训练模型（必传）
-        ema_model: EMA模型（可选，不传则只生成raw model的图）
+    (epoch, video_val, vae, val_diffusion, device, val_fold, generate_vessel_mask_adaptive, raw_model, ema_model=None)
+    三元组验证可视化（4行完整版）
+    行1: GT
+    行2: Masked输入
+    行3: 预测结果
+    行4: 血管mask
     """
     b_val, f_val, c_val, h_val, w_val = video_val.shape
     
-    # ========== 第一步：通用预处理（只做一次） ==========
-    # VAE编码（共用）
-    video_val_flat = rearrange(video_val, 'b f c h w -> (b f) c h w')
-    latent_val = vae.encode(video_val_flat).latent_dist.sample().mul_(0.18215)
-    latent_val = rearrange(latent_val, '(b f) c h w -> b f c h w', b=b_val)
-
-    # 构建mask（共用）
-    _, _, _, h_latent_val, w_latent_val = latent_val.shape
-    mask_val = torch.ones(b_val, f_val, h_latent_val, w_latent_val, device=device)
-    mask_val[:, 0, :, :] = 0.0
-    mask_val[:, -1, :, :] = 0.0
-
-    # 生成血管mask（共用，用于可视化）
+    # 确定当前阶段
+    if current_step < stage1_steps:
+        stage = 1
+        stage_name = "Stage1_Gap1"
+    elif current_step < stage2_steps:
+        stage = 2
+        stage_name = "Stage2_Gap2"
+    else:
+        stage = 3
+        stage_name = "Stage3_Gap4"
+    
+    # VAE编码全部密集帧
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
+        video_val_flat = rearrange(video_val, 'b f c h w -> (b f) c h w')
+        latent_val = vae.encode(video_val_flat).latent_dist.sample().mul_(0.18215)
+        latent_val = rearrange(latent_val, '(b f) c h w -> b f c h w', b=b_val)
+    
+    b_val, f_val, c_latent, h_latent_val, w_latent_val = latent_val.shape
+    sample_idx = 0
+    
+    # 生成血管mask可视化
     video_val_np = video_val.detach().cpu().numpy()
     video_val_gray = np.mean(video_val_np, axis=2)
-    sample_idx = 0
     frames_gray = [video_val_gray[sample_idx, t] for t in range(f_val)]
     mask_final, soft_weight = generate_vessel_mask_adaptive(frames_gray)
-
-    # 处理mask_val上采样（共用）
-    mask_val_single = mask_val[sample_idx:sample_idx+1]  # [1, F, 32, 32]
-    mask_val_5d = mask_val_single.unsqueeze(1)           # [1, 1, F, 32, 32]
-    mask_val_upsampled = F.interpolate(
-        mask_val_5d,
-        size=(f_val, h_val, w_val),
-        mode='nearest'
-    ).squeeze(1)  # [1, F, H, W]
-    mask_val_3c = mask_val_upsampled.unsqueeze(2).repeat(1, 1, 3, 1, 1)  # [1, F, 3, H, W]
-
-    # 血管mask可视化处理（共用）
-    vessel_mask_vis = torch.from_numpy(mask_final).float().to(device)  # [256,256]
-    vessel_mask_vis = vessel_mask_vis.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1,1,1,256,256]
-    vessel_mask_vis = vessel_mask_vis.repeat(1, f_val, 3, 1, 1)  # [1,F,3,256,256]
-    vessel_mask_vis = (vessel_mask_vis / 255.0) * 2 - 1  # 归一化到[-1,1]
-
-    # ========== 第二步：生成raw model的结果并保存 ==========
+    
+    vessel_mask_vis = torch.from_numpy(mask_final).float().to(device)
+    vessel_mask_vis = vessel_mask_vis.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    vessel_mask_vis = vessel_mask_vis.repeat(1, f_val, 3, 1, 1)
+    vessel_mask_vis = (vessel_mask_vis / 255.0) * 2 - 1
+    
+    # ========== 1. 基础预测（三元组，一步到位） ==========
     with torch.no_grad():
-        # 采样生成（raw model）
-        z = torch.randn_like(latent_val.permute(0, 2, 1, 3, 4))
-        samples_raw = val_diffusion.p_sample_loop(
-            raw_model.forward,
-            z.shape,
-            z,
-            clip_denoised=False,
-            progress=False,
-            device=device,
-            raw_x=latent_val.permute(0, 2, 1, 3, 4),
-            mask=mask_val
+        if stage == 1:
+            # 阶段1：三元组 [s, s+1, s+2]，预测s+1
+            triplet_latent = latent_val[:, 0:3, :, :, :]  # [B, 3, C, H, W]
+            triplet_video_gt = video_val[:, 0:3, :, :, :]
+            triplet_vessel_mask = vessel_mask_vis[:, 0:3, :, :, :]
+            frame_indices_original = [0, 1, 2]
+            
+        elif stage == 2:
+            # 阶段2：三元组 [s, s+2, s+4]，预测s+2
+            triplet_latent = torch.stack([
+                latent_val[:, 0],
+                latent_val[:, 2],
+                latent_val[:, 4]
+            ], dim=1)  # [B, 3, C, H, W]
+            triplet_video_gt = torch.stack([
+                video_val[:, 0],
+                video_val[:, 2],
+                video_val[:, 4]
+            ], dim=1)
+            triplet_vessel_mask = torch.stack([
+                vessel_mask_vis[:, 0],
+                vessel_mask_vis[:, 2],
+                vessel_mask_vis[:, 4]
+            ], dim=1)
+            frame_indices_original = [0, 2, 4]
+            
+        else:  # stage == 3
+            # 阶段3：三元组 [s, s+4, s+8]，预测s+4
+            triplet_latent = torch.stack([
+                latent_val[:, 0],
+                latent_val[:, 4],
+                latent_val[:, 8]
+            ], dim=1)
+            triplet_video_gt = torch.stack([
+                video_val[:, 0],
+                video_val[:, 4],
+                video_val[:, 8]
+            ], dim=1)
+            triplet_vessel_mask = torch.stack([
+                vessel_mask_vis[:, 0],
+                vessel_mask_vis[:, 4],
+                vessel_mask_vis[:, 8]
+            ], dim=1)
+            frame_indices_original = [0, 4, 8]
+        
+        # 构建三元组mask（首尾可见，中间预测）
+        mask_base = torch.ones(b_val, 3, h_latent_val, w_latent_val, device=device)
+        mask_base[:, 0, :, :] = 0  # 首帧可见
+        mask_base[:, 2, :, :] = 0  # 尾帧可见
+        
+        # 采样预测
+        z = torch.randn_like(triplet_latent.permute(0, 2, 1, 3, 4))
+        samples_base = val_diffusion.p_sample_loop(
+            raw_model.forward, z.shape, z,
+            clip_denoised=False, progress=False, device=device,
+            raw_x=triplet_latent.permute(0, 2, 1, 3, 4),
+            mask=mask_base
         )
-
-        # 解码（raw model）
-        samples_raw = samples_raw.permute(1, 0, 2, 3, 4) * mask_val + latent_val.permute(2, 0, 1, 3, 4) * (1 - mask_val)
-        samples_raw = samples_raw.permute(1, 2, 0, 3, 4)
-        samples_raw_flat = rearrange(samples_raw, 'b f c h w -> (b f) c h w') / 0.18215
-        decoded_raw = vae.decode(samples_raw_flat).sample
-        decoded_raw = rearrange(decoded_raw, '(b f) c h w -> b f c h w', b=b_val)
-
-        # 强制转灰度（raw model）
-        decoded_raw_gray = decoded_raw.mean(dim=2, keepdim=True)
-        decoded_raw = decoded_raw_gray.repeat(1, 1, 3, 1, 1)
-
-        # 拼接并保存raw model的图
-        video_val_single = video_val[sample_idx:sample_idx+1]
-        decoded_raw_single = decoded_raw[sample_idx:sample_idx+1]
-        val_pic_raw = torch.cat([
-            video_val_single,                  # 原始视频
-            video_val_single * (1 - mask_val_3c),  # mask后的视频
-            decoded_raw_single,                # raw model预测视频
-            vessel_mask_vis                    # 血管mask
-        ], dim=1)  # [1, 4*F, 3, H, W]
-
-        # 保存raw model的图
-        val_pic_raw_flat = rearrange(val_pic_raw, 'b f c h w -> (b f) c h w')
+        
+        # 解码
+        samples_base = samples_base.permute(1, 0, 2, 3, 4) * mask_base + triplet_latent.permute(2, 0, 1, 3, 4) * (1 - mask_base)
+        samples_base = samples_base.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W]
+        samples_base_flat = rearrange(samples_base, 'b f c h w -> (b f) c h w') / 0.18215
+        decoded_base = vae.decode(samples_base_flat).sample
+        decoded_base = rearrange(decoded_base, '(b f) c h w -> b f c h w', b=b_val)
+        decoded_base_gray = decoded_base.mean(dim=2, keepdim=True)
+        decoded_base = decoded_base_gray.repeat(1, 1, 3, 1, 1)
+        
+        # 构建mask可视化（灰色遮罩）
+        mask_base_vis = torch.ones(b_val, 3, 3, h_val, w_val, device=device) * 0.5  # 灰色
+        mask_base_vis[:, :, 0, :, :] = 0  # 首帧不遮罩
+        mask_base_vis[:, :, 2, :, :] = 0  # 尾帧不遮罩
+        
+        # 提取单个样本
+        video_val_single = triplet_video_gt[sample_idx:sample_idx+1]
+        decoded_base_single = decoded_base[sample_idx:sample_idx+1]
+        mask_base_vis_single = mask_base_vis[sample_idx:sample_idx+1]
+        vessel_mask_single = triplet_vessel_mask[sample_idx:sample_idx+1]
+        
+        # 拼接4行
+        val_pic_base = torch.cat([
+            video_val_single,                              # 第1行：GT三元组
+            video_val_single * (1 - mask_base_vis_single), # 第2行：Masked输入（灰色遮罩）
+            decoded_base_single,                           # 第3行：预测三元组
+            vessel_mask_single                             # 第4行：血管mask
+        ], dim=1)
+        
+        val_pic_base_flat = rearrange(val_pic_base, 'b f c h w -> (b f) c h w')
         save_image(
-            val_pic_raw_flat,
-            os.path.join(val_fold, f"Epoch_{epoch+1}_sample_raw.png"),
-            nrow=f_val,
+            val_pic_base_flat,
+            os.path.join(val_fold, f"Epoch_{epoch+1}_{stage_name}_base_triplet.png"),
+            nrow=3,  # 3列（三元组）
             normalize=True,
             value_range=(-1, 1)
         )
-        print(f"✅ Epoch {epoch+1} raw model可视化保存完成：{os.path.join(val_fold, f'Epoch_{epoch+1}_sample_raw.png')}")
-
-    # ========== 第三步：生成EMA model的结果并保存（如果传了ema_model） ==========
-    if ema_model is not None:
+        
+        print(f"✅ Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}）")
+        del z, samples_base, decoded_base
+    
+    # ========== 2. 递归链预测（逐层细化，完整帧序列） ==========
+    if stage >= 2:  # 阶段2和3才有递归链
         with torch.no_grad():
-            # 采样生成（EMA model）
-            z_ema = torch.randn_like(latent_val.permute(0, 2, 1, 3, 4))
-            samples_ema = val_diffusion.p_sample_loop(
-                ema_model.forward,  # 使用EMA模型
-                z_ema.shape,
-                z_ema,
-                clip_denoised=False,
-                progress=False,
-                device=device,
-                raw_x=latent_val.permute(0, 2, 1, 3, 4),
-                mask=mask_val
-            )
-
-            # 解码（EMA model）
-            samples_ema = samples_ema.permute(1, 0, 2, 3, 4) * mask_val + latent_val.permute(2, 0, 1, 3, 4) * (1 - mask_val)
-            samples_ema = samples_ema.permute(1, 2, 0, 3, 4)
-            samples_ema_flat = rearrange(samples_ema, 'b f c h w -> (b f) c h w') / 0.18215
-            decoded_ema = vae.decode(samples_ema_flat).sample
-            decoded_ema = rearrange(decoded_ema, '(b f) c h w -> b f c h w', b=b_val)
-
-            # 强制转灰度（EMA model）
-            decoded_ema_gray = decoded_ema.mean(dim=2, keepdim=True)
-            decoded_ema = decoded_ema_gray.repeat(1, 1, 3, 1, 1)
-
-            # 拼接并保存EMA model的图
-            decoded_ema_single = decoded_ema[sample_idx:sample_idx+1]
-            val_pic_ema = torch.cat([
-                video_val_single,                  # 原始视频
-                video_val_single * (1 - mask_val_3c),  # mask后的视频
-                decoded_ema_single,                # EMA model预测视频
-                vessel_mask_vis                    # 血管mask
-            ], dim=1)  # [1, 4*F, 3, H, W]
-
-            # 保存EMA model的图
-            val_pic_ema_flat = rearrange(val_pic_ema, 'b f c h w -> (b f) c h w')
+            if stage == 2:
+                # 阶段2递归链：5帧完整可视化
+                result_frames = [None] * 5
+                
+                # 第1步：用[s, s+4]预测s+2
+                triplet_step1 = torch.stack([latent_val[:, 0], latent_val[:, 2], latent_val[:, 4]], dim=1)
+                mask_step1 = torch.ones(b_val, 3, h_latent_val, w_latent_val, device=device)
+                mask_step1[:, 0, :, :] = 0
+                mask_step1[:, 2, :, :] = 0
+                
+                z1 = torch.randn_like(triplet_step1.permute(0, 2, 1, 3, 4))
+                samples1 = val_diffusion.p_sample_loop(
+                    raw_model.forward, z1.shape, z1,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=triplet_step1.permute(0, 2, 1, 3, 4),
+                    mask=mask_step1
+                )
+                samples1 = samples1.permute(1, 0, 2, 3, 4)
+                predicted_s2_latent = samples1[:, 1, :, :, :].clone()
+                
+                # 解码s+2
+                decoded_s2 = vae.decode(predicted_s2_latent / 0.18215).sample
+                decoded_s2_gray = decoded_s2.mean(dim=1, keepdim=True)
+                result_frames[0] = video_val[:, 0]  # s (GT)
+                result_frames[2] = decoded_s2_gray.repeat(1, 3, 1, 1)  # s+2 (预测)
+                result_frames[4] = video_val[:, 4]  # s+4 (GT)
+                
+                del z1, samples1
+                
+                # 第2步：用[s, pred_s+2]预测s+1
+                triplet_step2 = torch.stack([latent_val[:, 0], latent_val[:, 1], predicted_s2_latent.detach()], dim=1)
+                z2 = torch.randn_like(triplet_step2.permute(0, 2, 1, 3, 4))
+                samples2 = val_diffusion.p_sample_loop(
+                    raw_model.forward, z2.shape, z2,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=triplet_step2.permute(0, 2, 1, 3, 4),
+                    mask=mask_step1
+                )
+                samples2 = samples2.permute(1, 0, 2, 3, 4)
+                decoded_s1 = vae.decode(samples2[:, 1, :, :, :] / 0.18215).sample
+                decoded_s1_gray = decoded_s1.mean(dim=1, keepdim=True)
+                result_frames[1] = decoded_s1_gray.repeat(1, 3, 1, 1)
+                
+                del z2, samples2
+                
+                # 第3步：用[pred_s+2, s+4]预测s+3
+                triplet_step3 = torch.stack([predicted_s2_latent.detach(), latent_val[:, 3], latent_val[:, 4]], dim=1)
+                z3 = torch.randn_like(triplet_step3.permute(0, 2, 1, 3, 4))
+                samples3 = val_diffusion.p_sample_loop(
+                    raw_model.forward, z3.shape, z3,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=triplet_step3.permute(0, 2, 1, 3, 4),
+                    mask=mask_step1
+                )
+                samples3 = samples3.permute(1, 0, 2, 3, 4)
+                decoded_s3 = vae.decode(samples3[:, 1, :, :, :] / 0.18215).sample
+                decoded_s3_gray = decoded_s3.mean(dim=1, keepdim=True)
+                result_frames[3] = decoded_s3_gray.repeat(1, 3, 1, 1)
+                
+                del z3, samples3, predicted_s2_latent
+                
+                # 拼接5帧结果
+                result_video = torch.stack(result_frames, dim=1)  # [B, 5, C, H, W]
+                num_frames_rec = 5
+                
+            else:  # stage == 3
+                # 阶段3递归链：9帧完整可视化（简化版，直接预测）
+                mask_rec_all = torch.ones(b_val, f_val, h_latent_val, w_latent_val, device=device)
+                mask_rec_all[:, 0, :, :] = 0
+                mask_rec_all[:, 8, :, :] = 0
+                
+                z_rec = torch.randn_like(latent_val.permute(0, 2, 1, 3, 4))
+                samples_rec = val_diffusion.p_sample_loop(
+                    raw_model.forward, z_rec.shape, z_rec,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=latent_val.permute(0, 2, 1, 3, 4),
+                    mask=mask_rec_all
+                )
+                
+                samples_rec = samples_rec.permute(1, 0, 2, 3, 4) * mask_rec_all + latent_val.permute(2, 0, 1, 3, 4) * (1 - mask_rec_all)
+                samples_rec = samples_rec.permute(1, 2, 0, 3, 4)
+                samples_rec_flat = rearrange(samples_rec, 'b f c h w -> (b f) c h w') / 0.18215
+                decoded_rec = vae.decode(samples_rec_flat).sample
+                decoded_rec = rearrange(decoded_rec, '(b f) c h w -> b f c h w', b=b_val)
+                decoded_rec_gray = decoded_rec.mean(dim=2, keepdim=True)
+                result_video = decoded_rec_gray.repeat(1, 1, 3, 1, 1)
+                
+                num_frames_rec = 9
+                del z_rec, samples_rec
+            
+            # 构建递归链的mask可视化
+            video_val_rec = video_val[:, :num_frames_rec, :, :, :]
+            vessel_mask_rec = vessel_mask_vis[:, :num_frames_rec, :, :, :]
+            
+            mask_rec_vis = torch.ones(b_val, num_frames_rec, 3, h_val, w_val, device=device) * 0.5  # 灰色
+            mask_rec_vis[:, 0, :, :, :] = 0   # 首帧不遮罩
+            mask_rec_vis[:, -1, :, :, :] = 0  # 尾帧不遮罩
+            
+            # 提取单个样本
+            result_single = result_video[sample_idx:sample_idx+1]
+            video_val_rec_single = video_val_rec[sample_idx:sample_idx+1]
+            mask_rec_vis_single = mask_rec_vis[sample_idx:sample_idx+1]
+            vessel_mask_rec_single = vessel_mask_rec[sample_idx:sample_idx+1]
+            
+            # 拼接4行
+            val_pic_rec = torch.cat([
+                video_val_rec_single,                              # 第1行：GT完整帧
+                video_val_rec_single * (1 - mask_rec_vis_single),  # 第2行：Masked输入（只有首尾）
+                result_single,                                     # 第3行：递归链预测
+                vessel_mask_rec_single                             # 第4行：血管mask
+            ], dim=1)
+            
+            val_pic_rec_flat = rearrange(val_pic_rec, 'b f c h w -> (b f) c h w')
             save_image(
-                val_pic_ema_flat,
-                os.path.join(val_fold, f"Epoch_{epoch+1}_sample_ema.png"),
-                nrow=f_val,
+                val_pic_rec_flat,
+                os.path.join(val_fold, f"Epoch_{epoch+1}_{stage_name}_recursive_full.png"),
+                nrow=num_frames_rec,  # 5帧或9帧
                 normalize=True,
                 value_range=(-1, 1)
             )
-            print(f"✅ Epoch {epoch+1} EMA model可视化保存完成：{os.path.join(val_fold, f'Epoch_{epoch+1}_sample_ema.png')}")
+            
+            print(f"✅ Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部）")
+    
+    torch.cuda.empty_cache()
+
+# ========== 三元组loss计算函数 ==========
+def compute_triplet_loss(model, diffusion, latent_triplet, t, weight_batch=None, device=None):
+    """
+    计算三元组loss（首尾可见，预测中间）
+    Args:
+        latent_triplet: [B, 3, C, H, W]
+        weight_batch: [B, C, H, W] 可选的血管mask权重
+    Returns:
+        loss (scalar)
+    """
+    b, f, c, h, w = latent_triplet.shape
+    assert f == 3, f"必须是三元组，当前{f}帧"
+    
+    # 构建mask：首尾可见，中间预测
+    mask = torch.ones(b, f, h, w, device=device)
+    mask[:, 0, :, :] = 0
+    mask[:, 2, :, :] = 0
+    
+    # 计算loss
+    loss_dict = diffusion.training_losses(model, latent_triplet, t, mask=mask)
+    loss_all = loss_dict["loss"]  # [B, 3, C, H, W]
+    loss_middle = loss_all[:, 1, :, :, :]  # [B, C, H, W]
+    
+    # 血管mask加权
+    if weight_batch is not None:
+        weight_mean = weight_batch.mean()
+        loss_middle = loss_middle * weight_batch * (1.0 / weight_mean)
+    
+    return loss_middle.mean()
+
+# ========== 快速预测中间帧（无梯度） ==========
+@torch.no_grad()
+def fast_predict_middle_frame(model, val_diffusion, triplet_latent, mask, device):
+    """
+    快速预测中间帧（5步DDIM，节省显存）
+    Args:
+        triplet_latent: [B, 3, C, H, W]
+        mask: [B, 3, H, W]
+    Returns:
+        predicted_middle: [B, C, H, W]
+    """
+    z = torch.randn_like(triplet_latent.permute(0, 2, 1, 3, 4))
+    samples = val_diffusion.p_sample_loop(
+        model.forward, z.shape, z,
+        clip_denoised=False, progress=False, device=device,
+        raw_x=triplet_latent.permute(0, 2, 1, 3, 4),
+        mask=mask
+    )
+    samples = samples.permute(1, 0, 2, 3, 4)
+    predicted_middle = samples[:, 1, :, :, :].clone()
+    
+    # 立即释放
+    del samples, z
+    torch.cuda.empty_cache()
+    
+    return predicted_middle
+
+# ========== 阶段2递归链loss ==========
+def compute_recursive_loss_stage2_lowmem(model, diffusion, latent_dense, t, val_diffusion, device):
+    """
+    阶段2递归链（低显存版）
+    1. [s, s+4]预测s+2
+    2. [s, pred_s+2]预测s+1
+    3. [pred_s+2, s+4]预测s+3
+    
+    Args:
+        latent_dense: [B, 5, C, H, W]
+    Returns:
+        recursive_loss (scalar)
+    """
+    b, f, c, h, w = latent_dense.shape
+    assert f == 5, f"阶段2需要5帧，当前{f}帧"
+    
+    losses = []
+    mask_triplet = torch.ones(b, 3, h, w, device=device)
+    mask_triplet[:, 0, :, :] = 0
+    mask_triplet[:, 2, :, :] = 0
+    
+    # 第1步：预测s+2
+    triplet_step1 = torch.stack([latent_dense[:, 0], latent_dense[:, 2], latent_dense[:, 4]], dim=1)
+    predicted_s2 = fast_predict_middle_frame(model, val_diffusion, triplet_step1, mask_triplet, device)
+    
+    loss_dict = diffusion.training_losses(model, triplet_step1, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict
+    
+    # 第2步：用预测的s+2预测s+1
+    triplet_step2 = torch.stack([latent_dense[:, 0], latent_dense[:, 1], predicted_s2.detach()], dim=1)
+    loss_dict = diffusion.training_losses(model, triplet_step2, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict
+    
+    # 第3步：用预测的s+2预测s+3
+    triplet_step3 = torch.stack([predicted_s2.detach(), latent_dense[:, 3], latent_dense[:, 4]], dim=1)
+    loss_dict = diffusion.training_losses(model, triplet_step3, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict, predicted_s2
+    
+    torch.cuda.empty_cache()
+    return torch.stack(losses).mean()
+
+# ========== 阶段3递归链loss ==========
+def compute_recursive_loss_stage3_lowmem(model, diffusion, latent_dense, t, val_diffusion, device):
+    """
+    阶段3递归链（低显存版）
+    多层级联预测
+    
+    Args:
+        latent_dense: [B, 9, C, H, W]
+    Returns:
+        recursive_loss (scalar)
+    """
+    b, f, c, h, w = latent_dense.shape
+    assert f == 9, f"阶段3需要9帧，当前{f}帧"
+    
+    losses = []
+    mask_triplet = torch.ones(b, 3, h, w, device=device)
+    mask_triplet[:, 0, :, :] = 0
+    mask_triplet[:, 2, :, :] = 0
+    
+    # 第1层：预测s+4
+    triplet_l1 = torch.stack([latent_dense[:, 0], latent_dense[:, 4], latent_dense[:, 8]], dim=1)
+    predicted_s4 = fast_predict_middle_frame(model, val_diffusion, triplet_l1, mask_triplet, device)
+    loss_dict = diffusion.training_losses(model, triplet_l1, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict, triplet_l1
+    
+    # 第2层左：预测s+2
+    triplet_l2_left = torch.stack([latent_dense[:, 0], latent_dense[:, 2], predicted_s4.detach()], dim=1)
+    predicted_s2 = fast_predict_middle_frame(model, val_diffusion, triplet_l2_left, mask_triplet, device)
+    loss_dict = diffusion.training_losses(model, triplet_l2_left, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict, triplet_l2_left
+    
+    # 第2层右：预测s+6
+    triplet_l2_right = torch.stack([predicted_s4.detach(), latent_dense[:, 6], latent_dense[:, 8]], dim=1)
+    predicted_s6 = fast_predict_middle_frame(model, val_diffusion, triplet_l2_right, mask_triplet, device)
+    loss_dict = diffusion.training_losses(model, triplet_l2_right, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict, triplet_l2_right
+    
+    # 第3层：用预测的帧预测更细粒度（只计算loss，不再预测）
+    # s+1
+    triplet_l3_1 = torch.stack([latent_dense[:, 0], latent_dense[:, 1], predicted_s2.detach()], dim=1)
+    loss_dict = diffusion.training_losses(model, triplet_l3_1, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict, triplet_l3_1
+    
+    # s+3
+    triplet_l3_2 = torch.stack([predicted_s2.detach(), latent_dense[:, 3], predicted_s4.detach()], dim=1)
+    loss_dict = diffusion.training_losses(model, triplet_l3_2, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict, triplet_l3_2, predicted_s2
+    
+    # s+5
+    triplet_l3_3 = torch.stack([predicted_s4.detach(), latent_dense[:, 5], predicted_s6.detach()], dim=1)
+    loss_dict = diffusion.training_losses(model, triplet_l3_3, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict, triplet_l3_3, predicted_s4
+    
+    # s+7
+    triplet_l3_4 = torch.stack([predicted_s6.detach(), latent_dense[:, 7], latent_dense[:, 8]], dim=1)
+    loss_dict = diffusion.training_losses(model, triplet_l3_4, t, mask=mask_triplet)
+    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
+    del loss_dict, triplet_l3_4, predicted_s6
+    
+    torch.cuda.empty_cache()
+    return torch.stack(losses).mean()
 
 # -------------------------- 主训练函数（修改loss计算部分） --------------------------
 def main(args):
@@ -459,83 +757,64 @@ def main(args):
         logger = create_logger(None)
         tb_writer = None
 
+    # ========== 读取课程学习配置 ==========
     if hasattr(args, 'curriculum_learning') and args.curriculum_learning is not None:
         cl_config = args.curriculum_learning
-        stage1_steps = cl_config.get('stage1_steps', 20000)
-        stage2_steps = cl_config.get('stage2_steps', 40000)
-        recursive_weight = cl_config.get('recursive_loss_weight', 0.3)
-        max_dense_frames = cl_config.get('max_dense_frames', 9)
-        
-        # 验证权重配置
-        val_weights_config = cl_config.get('val_weights', {})
-        if not val_weights_config:
-            val_weights_config = {
-                'stage1': {'interval_1': 1.0},
-                'stage2': {'interval_1': 0.3, 'interval_2': 0.7},
-                'stage3': {'interval_1': 0.1, 'interval_2': 0.3, 'interval_4': 0.6}
-            }
+        stage1_steps = cl_config.get('stage1_steps', 1000)
+        stage2_steps = cl_config.get('stage2_steps', 2000)
+        recursive_weight = cl_config.get('recursive_loss_weight', 0.2)
+        recursive_sampling_steps = cl_config.get('recursive_sampling_steps', 5)
     else:
-        # 默认值（向后兼容旧配置文件）
         if rank == 0:
-            logger.warning("⚠️  配置文件中未找到 curriculum_learning 节点，使用硬编码默认参数")
-        stage1_steps = 20000
-        stage2_steps = 40000
-        recursive_weight = 0.3
-        max_dense_frames = 9
-        val_weights_config = {
+            logger.warning("⚠️  未找到课程学习配置，使用默认值")
+        stage1_steps = 1000
+        stage2_steps = 2000
+        recursive_weight = 0.2
+        recursive_sampling_steps = 5
+
+    # 验证tar_num_frames
+    if args.tar_num_frames != 3:
+        if rank == 0:
+            logger.warning(f"⚠️  tar_num_frames应为3，当前为{args.tar_num_frames}，自动调整")
+        args.tar_num_frames = 3
+
+    # 血管mask配置
+    if hasattr(args, 'vessel_mask') and args.vessel_mask is not None:
+        vessel_max_weight = args.vessel_mask.get('max_weight', 10.0)
+        vessel_mask_enable = args.vessel_mask.get('enable', True)
+    else:
+        vessel_max_weight = 10.0
+        vessel_mask_enable = True
+
+    # 打印配置
+    if rank == 0:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📚 三元组课程学习配置:")
+        logger.info(f"  阶段1: 0→{stage1_steps} steps, Gap=1, 3帧")
+        logger.info(f"  阶段2: {stage1_steps}→{stage2_steps} steps, Gap=2, 5帧")
+        logger.info(f"  阶段3: {stage2_steps}+ steps, Gap=4, 9帧")
+        logger.info(f"  递归链权重: {recursive_weight}")
+        logger.info(f"  递归链采样: {recursive_sampling_steps}步DDIM")
+        logger.info(f"  血管mask: {'启用' if vessel_mask_enable else '禁用'}")
+        logger.info(f"  显存优化: 混合精度={args.mixed_precision}, 梯度检查点={args.gradient_checkpointing}")
+        logger.info(f"{'='*60}\n")
+
+    # 存储到args
+    args.stage1_steps = stage1_steps
+    args.stage2_steps = stage2_steps
+    args.recursive_weight = recursive_weight
+    args.recursive_sampling_steps = recursive_sampling_steps
+
+    # 读取验证权重配置
+    if hasattr(cl_config, 'val_weights'):
+        args.val_weights_config = cl_config['val_weights']
+    else:
+        # 默认验证权重
+        args.val_weights_config = {
             'stage1': {'interval_1': 1.0},
             'stage2': {'interval_1': 0.3, 'interval_2': 0.7},
             'stage3': {'interval_1': 0.1, 'interval_2': 0.3, 'interval_4': 0.6}
         }
-    
-    # 验证tar_num_frames是否匹配密集帧数
-    if args.tar_num_frames != max_dense_frames:
-        if rank == 0:
-            logger.warning(
-                f"⚠️  tar_num_frames ({args.tar_num_frames}) != max_dense_frames ({max_dense_frames}), "
-                f"自动调整为 {max_dense_frames}"
-            )
-        args.tar_num_frames = max_dense_frames
-    
-    # 读取血管mask参数（兼容新旧配置）
-    if hasattr(args, 'vessel_mask'):
-        vessel_max_weight = args.vessel_mask.get('max_weight', 10.0)
-        vessel_base_weight = args.vessel_mask.get('base_weight', 1.0)
-        vessel_mask_enable = args.vessel_mask.get('enable', True)
-    else:
-        # 兼容旧版本配置
-        vessel_max_weight = getattr(args, 'vessel_max_weight', 10.0)
-        vessel_base_weight = 1.0
-        vessel_mask_enable = True
-
-    # 打印课程学习配置（仅rank0）
-    if rank == 0:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"📚 课程学习配置:")
-        logger.info(f"{'='*60}")
-        logger.info(f"  阶段1 (0 → {stage1_steps:,} steps):")
-        logger.info(f"    - 采样间隔: 1 (连续帧)")
-        logger.info(f"    - Loss策略: 纯基础Loss")
-        logger.info(f"  阶段2 ({stage1_steps:,} → {stage2_steps:,} steps):")
-        logger.info(f"    - 采样间隔: 2 (隔帧采样)")
-        logger.info(f"    - Loss策略: 基础Loss + 递归链(权重{recursive_weight})")
-        logger.info(f"  阶段3 ({stage2_steps:,}+ steps):")
-        logger.info(f"    - 采样间隔: 4 (大跨度采样)")
-        logger.info(f"    - Loss策略: 基础Loss + 多层递归链(权重{recursive_weight})")
-        logger.info(f"  密集帧数: {max_dense_frames}")
-        logger.info(f"  血管mask: {'启用' if vessel_mask_enable else '禁用'} (max_weight={vessel_max_weight})")
-        logger.info(f"  验证权重配置:")
-        for stage_key, weights in val_weights_config.items():
-            logger.info(f"    {stage_key}: {weights}")
-        logger.info(f"{'='*60}\n")
-    
-    # 将参数存储到args对象中（供后续函数使用）
-    args.stage1_steps = stage1_steps
-    args.stage2_steps = stage2_steps
-    args.recursive_weight = recursive_weight
-    args.max_dense_frames = max_dense_frames
-    args.val_weights_config = val_weights_config
-
     # 5. 模型初始化（先CPU创建，再移到GPU）
     assert args.image_size % 8 == 0, "Image size must be divisible by 8."
     latent_size = args.image_size // 8  # 256//8=32
@@ -780,6 +1059,14 @@ def main(args):
         if rank == 0:
             logger.info("Compiling model with torch.compile (delayed)")
         model = torch.compile(model, mode="reduce-overhead")
+    
+    # ========== 创建快速采样器（用于递归链） ==========
+    val_diffusion = create_diffusion(
+        timestep_respacing=f"ddim{args.recursive_sampling_steps}",
+        diffusion_steps=args.diffusion_steps
+    )
+    if rank == 0:
+        logger.info(f"递归链采样器: DDIM{args.recursive_sampling_steps}步")
     # 3. 最后一次显存清理
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
@@ -819,94 +1106,53 @@ def main(args):
                 pbar.update(1)
                 continue
 
-            # ========== 数据加载（密集帧） ==========
-            video = batch['video'].to(device, non_blocking=True)  # [B, F=9, C, H, W]
-            target_interval = batch['target_interval'][0].item()  # 当前阶段的目标间隔
-            b, f, c, h, w = video.shape  # f=9
+            # ========== 数据加载 ==========
+            video = batch['video'].to(device, non_blocking=True)
+            stage = batch['stage'][0].item()  # ✅ 从batch获取stage
+            frame_gap = batch['frame_gap'][0].item()  # ✅ 从batch获取frame_gap
+            b, f, c, h, w = video.shape
 
-            # ========== 生成血管mask（保持原逻辑） ==========
-            video_np = video.detach().cpu().numpy()
-            video_gray_np = np.mean(video_np, axis=2)
-            
-            weight_list = []
-            for i in range(b):
-                frames_gray = [video_gray_np[i, t] for t in range(f)]
-                max_weight = getattr(args, 'vessel_max_weight', 10.0)
-                _, soft_weight_np = generate_vessel_mask_adaptive(frames_gray, max_weight=max_weight)
-                weight_latent = prepare_mask_for_latent(soft_weight_np, latent_size, device)
-                weight_list.append(weight_latent)
-            
-            weight_batch = torch.cat(weight_list, dim=0)  # [B, 1, 32, 32]
-            weight_batch = weight_batch.unsqueeze(1).repeat(1, f, 1, 1, 1)  # [B, F, 1, 32, 32]
-
-            # ========== VAE编码（全部9帧） ==========
+            # VAE编码
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.mixed_precision):
                 video_flat = rearrange(video, 'b f c h w -> (b f) c h w')
-                latent = vae.encode(video_flat).latent_dist.sample()
-                latent.mul_(0.18215)
+                latent = vae.encode(video_flat).latent_dist.sample().mul_(0.18215)
                 latent = rearrange(latent, '(b f) c h w -> b f c h w', b=b)
 
-            b, f, c, h_latent, w_latent = latent.shape  # [B, 9, 4, 32, 32]
-
-            # ========== 构建主任务的稀疏mask ==========
-            visible_frames_idx = get_visible_frames(f, target_interval)
-            mask_main = torch.ones(b, f, h_latent, w_latent, device=device)
-            for idx in visible_frames_idx:
-                if idx < f:
-                    mask_main[:, idx, :, :] = 0  # 可见帧不mask
-
-            # 随机时间步
+            b, f, c_latent, h_latent, w_latent = latent.shape
             t = torch.randint(0, diffusion.num_timesteps, (b,), device=device)
 
-            # ========== 确定训练阶段 ==========
-            if train_steps < args.stage1_steps:
-                stage = 1
-            elif train_steps < args.stage2_steps:
-                stage = 2
-            else:
-                stage = 3
+            # ========== 生成血管mask ==========
+            weight_batch = None
+            if vessel_mask_enable:
+                video_np = video.detach().cpu().numpy()
+                video_gray_np = np.mean(video_np, axis=2)
+                weight_list = []
+                for i in range(b):
+                    frames_gray = [video_gray_np[i, t_idx] for t_idx in range(f)]
+                    _, soft_weight_np = generate_vessel_mask_adaptive(frames_gray, max_weight=vessel_max_weight)
+                    weight_latent = prepare_mask_for_latent(soft_weight_np, h_latent, device)
+                    weight_list.append(weight_latent)
+                weight_batch = torch.cat(weight_list, dim=0).squeeze(1).repeat(1, c_latent, 1, 1)
 
-            # ========== 阶段性课程学习Loss计算 ==========
+            # ========== 计算Loss（三元组 + 递归链） ==========
             with torch.cuda.amp.autocast(enabled=args.mixed_precision):
-                # 基础diffusion loss
-                loss_dict = diffusion.training_losses(model, latent, t, mask=mask_main)
-                base_loss = loss_dict["loss"]  # [B, F, C, 32, 32]
-                
-                # 血管mask加权
-                weight_expanded = weight_batch.repeat(1, 1, c, 1, 1)  # [B, F, C, 32, 32]
-                weight_mean = weight_expanded.mean()
-                norm_factor = 1.0 / weight_mean
-                base_loss_weighted = base_loss * weight_expanded * norm_factor
-                
-                # -------------------- 阶段1: 纯基础Loss --------------------
                 if stage == 1:
-                    loss = base_loss_weighted.mean() / args.gradient_accumulation_steps
-                    recursive_loss_value = 0.0  # 用于日志
+                    base_loss = compute_triplet_loss(model, diffusion, latent, t, weight_batch, device)
+                    loss = base_loss / args.gradient_accumulation_steps
+                    recursive_loss_value = 0.0
                 
-                # -------------------- 阶段2: 基础Loss + 递归链 --------------------
                 elif stage == 2:
-                    base_loss_mean = base_loss_weighted.mean()
-                    
-                    # 递归链Loss
-                    recursive_loss = compute_recursive_loss_stage2(
-                        model, diffusion, latent, t, f, b, h_latent, w_latent, device
-                    )
-                    
-                    # 最终Loss = 基础Loss + 0.3×递归链Loss
-                    loss = (base_loss_mean + args.recursive_weight * recursive_loss) / args.gradient_accumulation_steps
+                    latent_sparse = torch.stack([latent[:, 0], latent[:, 2], latent[:, 4]], dim=1)
+                    base_loss = compute_triplet_loss(model, diffusion, latent_sparse, t, weight_batch, device)
+                    recursive_loss = compute_recursive_loss_stage2_lowmem(model, diffusion, latent, t, val_diffusion, device)
+                    loss = (base_loss + args.recursive_weight * recursive_loss) / args.gradient_accumulation_steps
                     recursive_loss_value = recursive_loss.item()
                 
-                # -------------------- 阶段3: 基础Loss + 多层递归链 --------------------
                 else:  # stage == 3
-                    base_loss_mean = base_loss_weighted.mean()
-                    
-                    # 多层递归链Loss
-                    recursive_loss = compute_recursive_loss_stage3(
-                        model, diffusion, latent, t, f, b, h_latent, w_latent, device
-                    )
-                    
-                    # 最终Loss = 基础Loss + 配置权重×递归链Loss
-                    loss = (base_loss_mean + args.recursive_weight * recursive_loss) / args.gradient_accumulation_steps  # ✅ 使用配置参数
+                    latent_sparse = torch.stack([latent[:, 0], latent[:, 4], latent[:, 8]], dim=1)
+                    base_loss = compute_triplet_loss(model, diffusion, latent_sparse, t, weight_batch, device)
+                    recursive_loss = compute_recursive_loss_stage3_lowmem(model, diffusion, latent, t, val_diffusion, device)
+                    loss = (base_loss + args.recursive_weight * recursive_loss) / args.gradient_accumulation_steps
                     recursive_loss_value = recursive_loss.item()
 
             # ========== 反向传播（保持原逻辑） ==========
@@ -947,12 +1193,11 @@ def main(args):
                 # 打印进度（添加阶段和递归loss信息）
                 pbar.set_postfix({
                     "loss": f"{loss.item():.4f}",
-                    "stage": stage,
-                    "interval": target_interval,
-                    "rec_loss": f"{recursive_loss_value:.4f}",
-                    "grad_norm": f"{grad_norm:.4f}",
-                    "lr": f"{opt.param_groups[0]['lr']:.6f}",
-                    "ema_decay": f"{ema_decay:.6f}"
+                    "s": stage,
+                    "g": frame_gap,
+                    "f": f,
+                    "rec": f"{recursive_loss_value:.4f}",
+                    "gn": f"{grad_norm:.4f}"
                 })
 
                 # 定期日志
@@ -960,10 +1205,9 @@ def main(args):
                     avg_loss = running_loss / log_steps
                     steps_per_sec = log_steps / (time() - start_time)
                     logger.info(
-                        f"Step {train_steps:07d} | Stage {stage} | Interval {target_interval} | "
+                        f"Step {train_steps:07d} | Stage {stage} | Gap {frame_gap} | F={f} | "  # ✅
                         f"Loss: {avg_loss:.4f} | Rec Loss: {recursive_loss_value:.4f} | "
-                        f"Grad Norm: {grad_norm:.4f} | Steps/Sec: {steps_per_sec:.2f} | "
-                        f"EMA Decay: {ema_decay:.6f}"
+                        f"Grad Norm: {grad_norm:.4f} | Steps/Sec: {steps_per_sec:.2f}"
                     )
                     write_tensorboard(tb_writer, 'Train/Loss', avg_loss, train_steps)
                     write_tensorboard(tb_writer, 'Train/RecursiveLoss', recursive_loss_value, train_steps)
@@ -1039,6 +1283,9 @@ def main(args):
                     val_fold=val_fold,
                     generate_vessel_mask_adaptive=generate_vessel_mask_adaptive,
                     raw_model=get_raw_model(model),  # 原始模型（解包DDP）
+                    current_step=train_steps,
+                    stage1_steps=args.stage1_steps,
+                    stage2_steps=args.stage2_steps,
                     ema_model=ema                    # EMA模型（可选，传了就生成EMA的图）
                 )
             
@@ -1080,7 +1327,7 @@ def main(args):
             
             for interval in intervals_to_validate:
                 # 临时设置dataset的间隔（模拟不同阶段）
-                temp_step = {1: 0, 2: 20000, 4: 40000}[interval]
+                temp_step = {1: 0, 2: args.stage1_steps, 4: args.stage2_steps}[interval]  # ✅ 使用配置
                 dataset_val.set_training_step(temp_step)
                 
                 val_mae, val_mse, val_psnr = 0.0, 0.0, 0.0

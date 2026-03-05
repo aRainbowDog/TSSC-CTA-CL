@@ -53,30 +53,33 @@ class data_loader(torch.utils.data.Dataset):
     def __init__(self, configs, stage):
         self.stage = stage
         self.configs = configs
+        self.current_step = 0  # 新增：当前训练步数
         
-        # ========== 核心修改：改为密集帧返回 ==========
-        self.max_frames = 9  # 密集帧数（支持间隔4采样：0,4,8）
-        self.target_video_len = self.max_frames  # 始终返回9帧
-        self.current_step = 0  # 当前训练步数（用于确定采样间隔）
-        
-        # ========== 【修复】读取课程学习阶段阈值 ==========
+        # ========== 新增：读取课程学习配置 ==========
         if hasattr(configs, 'curriculum_learning') and configs.curriculum_learning is not None:
             cl_config = configs.curriculum_learning
-            self.stage1_steps = cl_config.get('stage1_steps', 20000)
-            self.stage2_steps = cl_config.get('stage2_steps', 40000)
-            max_dense_frames = cl_config.get('max_dense_frames', 9)
-            # 验证max_frames与配置一致
-            if max_dense_frames != self.max_frames:
-                print(f"⚠️  配置中的max_dense_frames ({max_dense_frames}) != 硬编码的max_frames ({self.max_frames}), 使用配置值")
-                self.max_frames = max_dense_frames
-                self.target_video_len = max_dense_frames
+            self.stage1_steps = cl_config.get('stage1_steps', 1000)
+            self.stage2_steps = cl_config.get('stage2_steps', 2000)
+            
+            self.stage1_gap = cl_config.get('stage1_frame_gap', 1)
+            self.stage1_frames = cl_config.get('stage1_dense_frames', 3)
+            
+            self.stage2_gap = cl_config.get('stage2_frame_gap', 2)
+            self.stage2_frames = cl_config.get('stage2_dense_frames', 5)
+            
+            self.stage3_gap = cl_config.get('stage3_frame_gap', 4)
+            self.stage3_frames = cl_config.get('stage3_dense_frames', 9)
         else:
-            # 默认值（向后兼容旧配置文件）
-            self.stage1_steps = 20000
-            self.stage2_steps = 40000
+            # 默认值
+            self.stage1_steps = 1000
+            self.stage2_steps = 2000
+            self.stage1_gap, self.stage1_frames = 1, 3
+            self.stage2_gap, self.stage2_frames = 2, 5
+            self.stage3_gap, self.stage3_frames = 4, 9
+
+        print(f"[{self.stage}] 三元组+密集帧模式 | Gap: {self.stage1_gap}/{self.stage2_gap}/{self.stage3_gap}")
         
         self.v_decoder = DecordInit()
-        self.temporal_sample = TemporalRandomCrop(self.max_frames)  # 修复：使用max_frames而非configs.tar_num_frames
         
         # 数据变换：区分训练/测试（训练可加随机翻转）
         transform_list = [
@@ -103,7 +106,7 @@ class data_loader(torch.utils.data.Dataset):
         else:
             raise ValueError(f"stage 必须是 train/val/test，当前为 {self.stage}")
         
-        print(f"[{self.stage}] 加载视频数量: {len(self.video_lists)} | 返回密集帧数: {self.max_frames} | 阶段阈值: {self.stage1_steps}/{self.stage2_steps}")
+        print(f"[{self.stage}] 加载视频数量: {len(self.video_lists)} | 三元组+密集帧模式 | 阶段阈值: {self.stage1_steps}/{self.stage2_steps}")
 
     def set_training_step(self, step):
         """从训练循环中设置当前步数（用于确定采样间隔）"""
@@ -136,6 +139,15 @@ class data_loader(torch.utils.data.Dataset):
             frames = torch.from_numpy(frames).permute(0, 3, 1, 2)  # 转为 TCHW
             return frames
 
+    def _get_stage_config(self, step):
+        """根据步数返回(stage, gap, dense_frames)"""
+        if step < self.stage1_steps:
+            return 1, self.stage1_gap, self.stage1_frames
+        elif step < self.stage2_steps:
+            return 2, self.stage2_gap, self.stage2_frames
+        else:
+            return 3, self.stage3_gap, self.stage3_frames
+    
     def __getitem__(self, index):
         # 1. 读取当前切片视频
         path = self.video_lists[index]
@@ -154,42 +166,39 @@ class data_loader(torch.utils.data.Dataset):
         vframes = self._read_video_safe(path)
         vframes = vframes.to(torch.uint8)  # 转为uint8，避免归一化异常
 
-        # ========== 核心修改：始终采样密集的连续帧 ==========
-        total_frames = len(vframes)
-        target_interval = self._get_interval_for_step(self.current_step)
-        
-        if self.stage == 'train':
-            # 训练：随机选择局部连续的max_frames帧
-            required_length = self.max_frames
-            if total_frames >= required_length:
-                max_start = total_frames - required_length
-                start_idx = random.randint(0, max_start)
-                frame_indice = np.arange(start_idx, start_idx + required_length)
-            else:
-                # 帧数不足，用边界填充
-                frame_indice = np.arange(0, total_frames)
-                frame_indice = np.pad(frame_indice, 
-                                      (0, required_length - len(frame_indice)), 
-                                      mode='edge')
-        else:
-            # 验证/测试：从头开始采样密集帧
-            frame_indice = np.arange(0, min(total_frames, self.max_frames))
-            if len(frame_indice) < self.max_frames:
-                frame_indice = np.pad(frame_indice, 
-                                      (0, self.max_frames - len(frame_indice)), 
-                                      mode='edge')
 
-        video = vframes[frame_indice]  # [F=9, C, H, W]
-        
-        # 3. 数据变换（归一化等）
+        # ========== 根据阶段采样密集帧 ==========
+        total_frames = len(vframes)
+        stage, frame_gap, num_dense_frames = self._get_stage_config(self.current_step)
+
+        if self.stage == 'train':
+            # 训练：随机选择局部密集帧
+            if total_frames >= num_dense_frames:
+                max_start = total_frames - num_dense_frames
+                start_idx = random.randint(0, max_start)
+                frame_indices = list(range(start_idx, start_idx + num_dense_frames))
+            else:
+                # 帧数不足，边界填充
+                frame_indices = list(range(total_frames))
+                frame_indices += [total_frames - 1] * (num_dense_frames - total_frames)
+        else:
+            # 验证/测试：从头采样
+            if total_frames >= num_dense_frames:
+                frame_indices = list(range(num_dense_frames))
+            else:
+                frame_indices = list(range(total_frames))
+                frame_indices += [total_frames - 1] * (num_dense_frames - total_frames)
+
+        video = vframes[frame_indices]
         video = self.transform(video)
 
         return {
-            'video': video,  # [F=9, C, H, W]，密集帧
+            'video': video,  # [3/5/9, C, H, W]
             'video_name': f"{patient_name}_slice_{slice_num:02d}",
             'video_gt': video.clone(),
             'video_path': self.video_lists[index],
-            'target_interval': target_interval  # 返回当前阶段的目标间隔
+            'stage': stage,       # 新增
+            'frame_gap': frame_gap  # 新增
         }
 
     def __len__(self):
