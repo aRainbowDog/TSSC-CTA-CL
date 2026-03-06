@@ -36,6 +36,24 @@ from pathlib import Path
 from skimage.filters import apply_hysteresis_threshold
 warnings.filterwarnings('ignore')
 
+def _extract_into_tensor(arr, timesteps, broadcast_shape):
+    """
+    从1D numpy数组中提取值，用于batch处理
+    Args:
+        arr: 1D numpy array
+        timesteps: [B] tensor of timestep indices
+        broadcast_shape: 目标形状
+    Returns:
+        extracted values with correct shape
+    """
+    if isinstance(arr, np.ndarray):
+        arr = torch.from_numpy(arr).to(device=timesteps.device, dtype=torch.float32)
+    
+    res = arr[timesteps]
+    while len(res.shape) < len(broadcast_shape):
+        res = res[..., None]
+    
+    return res.expand(broadcast_shape)
 # -------------------------- 新增：Mask生成函数 --------------------------
 def generate_vessel_mask_adaptive(frames_gray, max_weight=100.0, base_weight=1.0):
     """
@@ -144,41 +162,71 @@ def get_visible_frames(total_frames, interval):
 def compute_recursive_loss_stage2(model, diffusion, latent, t, f, b, h_latent, w_latent, device):
     """
     阶段2的递归链Loss: 用间隔2补全间隔1
+    ✅ 方案3：手动计算loss（完全绕过training_losses）
     Args:
         model: 模型
-        diffusion: 扩散模型
+        diffusion: 扩散模型对象
         latent: 潜在编码 [B, F, C, H, W]
-        t: 时间步
+        t: 时间步 [B]
         f: 帧数
         其他: 维度信息
     Returns:
         递归链loss (tensor)
     """
     recursive_losses = []
-    # 递归对: (left_idx, right_idx, middle_idx)
-    # 用0,2预测1; 用2,4预测3; 用4,6预测5; 用6,8预测7
     pairs = [(0, 2, 1), (2, 4, 3), (4, 6, 5), (6, 8, 7)]
     
     for left_idx, right_idx, mid_idx in pairs:
-        if mid_idx < f:  # 防止越界
-            # 构建mask：只有left和right可见
-            mask_recursive = torch.ones(b, f, h_latent, w_latent, device=device)
-            mask_recursive[:, left_idx, :, :] = 0  # left可见
-            mask_recursive[:, right_idx, :, :] = 0  # right可见
-            # middle保持为1（需要预测）
+        if mid_idx < f:
+            # ========== 步骤1：提取三元组 ==========
+            triplet = torch.stack([
+                latent[:, left_idx],   # [B, C, H, W]
+                latent[:, mid_idx],    # [B, C, H, W] - 目标帧
+                latent[:, right_idx]   # [B, C, H, W]
+            ], dim=1)  # [B, 3, C, H, W]
             
-            # 计算loss（只针对middle帧）
-            loss_dict_rec = diffusion.training_losses(
-                model, 
-                latent, 
-                t, 
-                mask=mask_recursive
+            x_start = triplet.permute(0, 2, 1, 3, 4)  # [B, C, 3, H, W]
+            
+            # ========== 步骤2：生成噪声 ==========
+            noise = torch.randn_like(x_start)
+            
+            # ========== 步骤3：提取扩散系数 ==========
+            sqrt_alphas_cumprod = _extract_into_tensor(
+                diffusion.sqrt_alphas_cumprod, t, x_start.shape
             )
-            # 只取middle帧的loss
-            rec_loss_single = loss_dict_rec["loss"][:, mid_idx]  # [B, C, 32, 32]
-            recursive_losses.append(rec_loss_single.mean())
+            sqrt_one_minus_alphas_cumprod = _extract_into_tensor(
+                diffusion.sqrt_one_minus_alphas_cumprod, t, x_start.shape
+            )
+            
+            # ========== 步骤4：加噪 q(x_t | x_0) ==========
+            x_t = sqrt_alphas_cumprod * x_start + sqrt_one_minus_alphas_cumprod * noise
+            
+            # ========== 步骤5：构建mask（left和right可见，middle需要预测）==========
+            # 转换回 [B, 3, C, H, W] 方便mask操作
+            x_t_frames = x_t.permute(0, 2, 1, 3, 4)      # [B, 3, C, H, W]
+            x_start_frames = x_start.permute(0, 2, 1, 3, 4)  # [B, 3, C, H, W]
+            
+            # mask: [B, 3, 1, H, W]，1表示需要预测（mask掉），0表示可见
+            mask = torch.ones(b, 3, 1, h_latent, w_latent, device=device)
+            mask[:, 0] = 0  # left可见
+            mask[:, 2] = 0  # right可见
+            # middle (idx=1) 保持为1（需要预测）
+            
+            # ========== 步骤6：融合可见帧和noisy帧 ==========
+            model_input = x_start_frames * (1 - mask) + x_t_frames * mask  # [B, 3, C, H, W]
+            
+            # ========== 步骤7：模型预测噪声 ==========
+            model_output = model(model_input, t)  # [B, 3, C, H, W]
+            
+            # ========== 步骤8：只计算中间帧的loss ==========
+            # 提取中间帧的预测和目标
+            pred_noise_middle = model_output[:, 1, :, :, :]  # [B, C, H, W]
+            target_noise_middle = noise.permute(0, 2, 1, 3, 4)[:, 1, :, :, :]  # [B, C, H, W]
+            
+            # MSE loss
+            loss_middle = F.mse_loss(pred_noise_middle, target_noise_middle, reduction='mean')
+            recursive_losses.append(loss_middle)
     
-    # 返回平均递归loss
     if recursive_losses:
         return torch.stack(recursive_losses).mean()
     else:
@@ -187,52 +235,77 @@ def compute_recursive_loss_stage2(model, diffusion, latent, t, f, b, h_latent, w
 def compute_recursive_loss_stage3(model, diffusion, latent, t, f, b, h_latent, w_latent, device):
     """
     阶段3的多层递归链Loss: 间隔4 → 间隔2 → 间隔1
+    ✅ 方案3：手动计算loss
     """
-    # 第一层递归：用间隔4补全到间隔2
-    # 用帧0,8预测帧4
-    mask_l1 = torch.ones(b, f, h_latent, w_latent, device=device)
-    mask_l1[:, 0, :, :] = 0  # 帧0可见
-    mask_l1[:, 8, :, :] = 0  # 帧8可见（假设f>=9）
+    all_losses = []
     
+    # ========== 辅助函数：计算单个三元组的loss ==========
+    def compute_single_triplet_loss(left_idx, mid_idx, right_idx):
+        """计算单个三元组[left, middle, right]的loss"""
+        # 提取三元组
+        triplet = torch.stack([
+            latent[:, left_idx],
+            latent[:, mid_idx],   # 目标帧
+            latent[:, right_idx]
+        ], dim=1)  # [B, 3, C, H, W]
+        
+        x_start = triplet.permute(0, 2, 1, 3, 4)  # [B, C, 3, H, W]
+        noise = torch.randn_like(x_start)
+        
+        # 提取扩散系数
+        sqrt_alphas = _extract_into_tensor(
+            diffusion.sqrt_alphas_cumprod, t, x_start.shape
+        )
+        sqrt_one_minus = _extract_into_tensor(
+            diffusion.sqrt_one_minus_alphas_cumprod, t, x_start.shape
+        )
+        
+        # 加噪
+        x_t = sqrt_alphas * x_start + sqrt_one_minus * noise
+        
+        # 构建mask
+        x_t_frames = x_t.permute(0, 2, 1, 3, 4)
+        x_start_frames = x_start.permute(0, 2, 1, 3, 4)
+        
+        mask = torch.ones(b, 3, 1, h_latent, w_latent, device=device)
+        mask[:, 0] = 0  # left可见
+        mask[:, 2] = 0  # right可见
+        
+        # 融合
+        model_input = x_start_frames * (1 - mask) + x_t_frames * mask
+        
+        # 模型预测
+        model_output = model(model_input, t)
+        
+        # 计算中间帧loss
+        pred_middle = model_output[:, 1, :, :, :]
+        target_middle = noise.permute(0, 2, 1, 3, 4)[:, 1, :, :, :]
+        
+        return F.mse_loss(pred_middle, target_middle, reduction='mean')
+    
+    # ========== 第一层递归：用帧0,8预测帧4 ==========
     if f > 4:
-        loss_dict_l1 = diffusion.training_losses(model, latent, t, mask=mask_l1)
-        layer1_loss = loss_dict_l1["loss"][:, 4].mean()  # 只取帧4
+        layer1_loss = compute_single_triplet_loss(0, 4, 8)
+        all_losses.append(layer1_loss)
+    
+    # ========== 第二层递归：用间隔2补全到间隔1 ==========
+    layer2_pairs = [(0, 2, 4), (4, 6, 8)]
+    for left_idx, mid_idx, right_idx in layer2_pairs:
+        if mid_idx < f:
+            loss = compute_single_triplet_loss(left_idx, mid_idx, right_idx)
+            all_losses.append(loss)
+    
+    # ========== 第三层递归：用间隔1补全所有奇数帧 ==========
+    layer3_pairs = [(0, 1, 2), (2, 3, 4), (4, 5, 6), (6, 7, 8)]
+    for left_idx, mid_idx, right_idx in layer3_pairs:
+        if mid_idx < f:
+            loss = compute_single_triplet_loss(left_idx, mid_idx, right_idx)
+            all_losses.append(loss)
+    
+    if all_losses:
+        return torch.stack(all_losses).mean()
     else:
-        layer1_loss = torch.tensor(0.0, device=device)
-    
-    # 第二层递归：用间隔2补全到间隔1
-    # 用0,4预测2; 用4,8预测6
-    layer2_losses = []
-    layer2_pairs = [(0, 4, 2), (4, 8, 6)]
-    
-    for left_idx, right_idx, mid_idx in layer2_pairs:
-        if mid_idx < f:
-            mask_l2 = torch.ones(b, f, h_latent, w_latent, device=device)
-            mask_l2[:, left_idx, :, :] = 0
-            mask_l2[:, right_idx, :, :] = 0
-            loss_dict_l2 = diffusion.training_losses(model, latent, t, mask=mask_l2)
-            layer2_losses.append(loss_dict_l2["loss"][:, mid_idx].mean())
-    
-    layer2_loss = torch.stack(layer2_losses).mean() if layer2_losses else torch.tensor(0.0, device=device)
-    
-    # 第三层递归：用间隔1补全所有奇数帧
-    # 用0,2预测1; 用2,4预测3; 用4,6预测5; 用6,8预测7
-    layer3_losses = []
-    layer3_pairs = [(0, 2, 1), (2, 4, 3), (4, 6, 5), (6, 8, 7)]
-    
-    for left_idx, right_idx, mid_idx in layer3_pairs:
-        if mid_idx < f:
-            mask_l3 = torch.ones(b, f, h_latent, w_latent, device=device)
-            mask_l3[:, left_idx, :, :] = 0
-            mask_l3[:, right_idx, :, :] = 0
-            loss_dict_l3 = diffusion.training_losses(model, latent, t, mask=mask_l3)
-            layer3_losses.append(loss_dict_l3["loss"][:, mid_idx].mean())
-    
-    layer3_loss = torch.stack(layer3_losses).mean() if layer3_losses else torch.tensor(0.0, device=device)
-    
-    # 三层递归loss的平均
-    recursive_loss = (layer1_loss + layer2_loss + layer3_loss) / 3.0
-    return recursive_loss
+        return torch.tensor(0.0, device=device)
 
 def set_optimizer_zeros_grad(optimizer, set_to_none=True):
     """安全的optimizer梯度清零，减少显存碎片"""
@@ -550,12 +623,7 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
 # ========== 三元组loss计算函数 ==========
 def compute_triplet_loss(model, diffusion, latent_triplet, t, weight_batch=None, device=None):
     """
-    计算三元组loss（首尾可见，预测中间）
-    Args:
-        latent_triplet: [B, 3, C, H, W]
-        weight_batch: [B, C, H, W] 可选的血管mask权重
-    Returns:
-        loss (scalar)
+    计算三元组loss（首尾可见，预测中间）- 修正版
     """
     b, f, c, h, w = latent_triplet.shape
     assert f == 3, f"必须是三元组，当前{f}帧"
@@ -565,10 +633,41 @@ def compute_triplet_loss(model, diffusion, latent_triplet, t, weight_batch=None,
     mask[:, 0, :, :] = 0
     mask[:, 2, :, :] = 0
     
-    # 计算loss
-    loss_dict = diffusion.training_losses(model, latent_triplet, t, mask=mask)
-    loss_all = loss_dict["loss"]  # [B, 3, C, H, W]
-    loss_middle = loss_all[:, 1, :, :, :]  # [B, C, H, W]
+    # 使用diffusion的前向过程添加噪声
+    latent_permuted = latent_triplet.permute(0, 2, 1, 3, 4)  # [B, C, 3, H, W]
+    noise = torch.randn_like(latent_permuted)
+    x_t = diffusion.q_sample(latent_permuted, t, noise=noise)  # [B, C, 3, H, W]
+    
+    # 恢复到 [B, 3, C, H, W] 供模型输入
+    x_t = x_t.permute(0, 2, 1, 3, 4)  # [B, 3, C, H, W]
+    
+    # 构建输入：首尾用GT，中间用噪声
+    # mask: [B, 3, H, W]，0表示可见（GT），1表示预测（噪声）
+    model_input = latent_triplet * (1 - mask.unsqueeze(2)) + x_t * mask.unsqueeze(2)
+    
+    # 模型forward
+    model_output = model(model_input, t)  # [B, 3, C_out, H, W]
+    
+    # ===== 关键修正：通过形状判断是否需要分离 =====
+    if model_output.shape[2] == c * 2:  # 如果输出通道数是输入的2倍（learn_sigma=True）
+        model_output, _ = torch.split(model_output, c, dim=2)  # 分离均值和方差，取均值
+    
+    # 提取中间帧的预测和目标
+    pred_middle = model_output[:, 1, :, :, :]  # [B, C, H, W]
+    
+    # 目标是原始的latent（去噪后的）
+    if diffusion.model_mean_type == 0:  # EPSILON（预测噪声）
+        # 从噪声预测x0
+        target_middle = diffusion._predict_xstart_from_eps(
+            x_t=x_t.permute(0, 2, 1, 3, 4)[:, :, 1, :, :],  # [B, C, H, W]
+            t=t,
+            eps=noise.permute(0, 2, 1, 3, 4)[:, :, 1, :, :]
+        )
+    else:  # START_X（直接预测x0）
+        target_middle = latent_triplet[:, 1, :, :, :]  # [B, C, H, W]
+    
+    # 计算MSE loss
+    loss_middle = (pred_middle - target_middle) ** 2  # [B, C, H, W]
     
     # 血管mask加权
     if weight_batch is not None:
@@ -606,17 +705,7 @@ def fast_predict_middle_frame(model, val_diffusion, triplet_latent, mask, device
 
 # ========== 阶段2递归链loss ==========
 def compute_recursive_loss_stage2_lowmem(model, diffusion, latent_dense, t, val_diffusion, device):
-    """
-    阶段2递归链（低显存版）
-    1. [s, s+4]预测s+2
-    2. [s, pred_s+2]预测s+1
-    3. [pred_s+2, s+4]预测s+3
-    
-    Args:
-        latent_dense: [B, 5, C, H, W]
-    Returns:
-        recursive_loss (scalar)
-    """
+    """阶段2递归链（修正版）"""
     b, f, c, h, w = latent_dense.shape
     assert f == 5, f"阶段2需要5帧，当前{f}帧"
     
@@ -627,91 +716,47 @@ def compute_recursive_loss_stage2_lowmem(model, diffusion, latent_dense, t, val_
     
     # 第1步：预测s+2
     triplet_step1 = torch.stack([latent_dense[:, 0], latent_dense[:, 2], latent_dense[:, 4]], dim=1)
-    predicted_s2 = fast_predict_middle_frame(model, val_diffusion, triplet_step1, mask_triplet, device)
     
-    loss_dict = diffusion.training_losses(model, triplet_step1, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict
+    # 调用修正后的compute_triplet_loss
+    loss1 = compute_triplet_loss(model, diffusion, triplet_step1, t, None, device)
+    losses.append(loss1)
     
-    # 第2步：用预测的s+2预测s+1
-    triplet_step2 = torch.stack([latent_dense[:, 0], latent_dense[:, 1], predicted_s2.detach()], dim=1)
-    loss_dict = diffusion.training_losses(model, triplet_step2, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict
+    # 第2步：用预测的s+2预测s+1（简化：直接用GT的s+2）
+    triplet_step2 = torch.stack([latent_dense[:, 0], latent_dense[:, 1], latent_dense[:, 2]], dim=1)
+    loss2 = compute_triplet_loss(model, diffusion, triplet_step2, t, None, device)
+    losses.append(loss2)
     
-    # 第3步：用预测的s+2预测s+3
-    triplet_step3 = torch.stack([predicted_s2.detach(), latent_dense[:, 3], latent_dense[:, 4]], dim=1)
-    loss_dict = diffusion.training_losses(model, triplet_step3, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict, predicted_s2
+    # 第3步：预测s+3
+    triplet_step3 = torch.stack([latent_dense[:, 2], latent_dense[:, 3], latent_dense[:, 4]], dim=1)
+    loss3 = compute_triplet_loss(model, diffusion, triplet_step3, t, None, device)
+    losses.append(loss3)
     
     torch.cuda.empty_cache()
     return torch.stack(losses).mean()
 
 # ========== 阶段3递归链loss ==========
 def compute_recursive_loss_stage3_lowmem(model, diffusion, latent_dense, t, val_diffusion, device):
-    """
-    阶段3递归链（低显存版）
-    多层级联预测
-    
-    Args:
-        latent_dense: [B, 9, C, H, W]
-    Returns:
-        recursive_loss (scalar)
-    """
+    """阶段3递归链（修正版）"""
     b, f, c, h, w = latent_dense.shape
     assert f == 9, f"阶段3需要9帧，当前{f}帧"
     
     losses = []
-    mask_triplet = torch.ones(b, 3, h, w, device=device)
-    mask_triplet[:, 0, :, :] = 0
-    mask_triplet[:, 2, :, :] = 0
     
     # 第1层：预测s+4
     triplet_l1 = torch.stack([latent_dense[:, 0], latent_dense[:, 4], latent_dense[:, 8]], dim=1)
-    predicted_s4 = fast_predict_middle_frame(model, val_diffusion, triplet_l1, mask_triplet, device)
-    loss_dict = diffusion.training_losses(model, triplet_l1, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict, triplet_l1
+    losses.append(compute_triplet_loss(model, diffusion, triplet_l1, t, None, device))
     
-    # 第2层左：预测s+2
-    triplet_l2_left = torch.stack([latent_dense[:, 0], latent_dense[:, 2], predicted_s4.detach()], dim=1)
-    predicted_s2 = fast_predict_middle_frame(model, val_diffusion, triplet_l2_left, mask_triplet, device)
-    loss_dict = diffusion.training_losses(model, triplet_l2_left, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict, triplet_l2_left
+    # 第2层：预测s+2和s+6
+    triplet_l2_left = torch.stack([latent_dense[:, 0], latent_dense[:, 2], latent_dense[:, 4]], dim=1)
+    losses.append(compute_triplet_loss(model, diffusion, triplet_l2_left, t, None, device))
     
-    # 第2层右：预测s+6
-    triplet_l2_right = torch.stack([predicted_s4.detach(), latent_dense[:, 6], latent_dense[:, 8]], dim=1)
-    predicted_s6 = fast_predict_middle_frame(model, val_diffusion, triplet_l2_right, mask_triplet, device)
-    loss_dict = diffusion.training_losses(model, triplet_l2_right, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict, triplet_l2_right
+    triplet_l2_right = torch.stack([latent_dense[:, 4], latent_dense[:, 6], latent_dense[:, 8]], dim=1)
+    losses.append(compute_triplet_loss(model, diffusion, triplet_l2_right, t, None, device))
     
-    # 第3层：用预测的帧预测更细粒度（只计算loss，不再预测）
-    # s+1
-    triplet_l3_1 = torch.stack([latent_dense[:, 0], latent_dense[:, 1], predicted_s2.detach()], dim=1)
-    loss_dict = diffusion.training_losses(model, triplet_l3_1, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict, triplet_l3_1
-    
-    # s+3
-    triplet_l3_2 = torch.stack([predicted_s2.detach(), latent_dense[:, 3], predicted_s4.detach()], dim=1)
-    loss_dict = diffusion.training_losses(model, triplet_l3_2, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict, triplet_l3_2, predicted_s2
-    
-    # s+5
-    triplet_l3_3 = torch.stack([predicted_s4.detach(), latent_dense[:, 5], predicted_s6.detach()], dim=1)
-    loss_dict = diffusion.training_losses(model, triplet_l3_3, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict, triplet_l3_3, predicted_s4
-    
-    # s+7
-    triplet_l3_4 = torch.stack([predicted_s6.detach(), latent_dense[:, 7], latent_dense[:, 8]], dim=1)
-    loss_dict = diffusion.training_losses(model, triplet_l3_4, t, mask=mask_triplet)
-    losses.append(loss_dict["loss"][:, 1, :, :, :].mean())
-    del loss_dict, triplet_l3_4, predicted_s6
+    # 第3层：预测s+1, s+3, s+5, s+7
+    for left, mid, right in [(0,1,2), (2,3,4), (4,5,6), (6,7,8)]:
+        triplet = torch.stack([latent_dense[:, left], latent_dense[:, mid], latent_dense[:, right]], dim=1)
+        losses.append(compute_triplet_loss(model, diffusion, triplet, t, None, device))
     
     torch.cuda.empty_cache()
     return torch.stack(losses).mean()
@@ -760,17 +805,19 @@ def main(args):
     # ========== 读取课程学习配置 ==========
     if hasattr(args, 'curriculum_learning') and args.curriculum_learning is not None:
         cl_config = args.curriculum_learning
-        stage1_steps = cl_config.get('stage1_steps', 1000)
-        stage2_steps = cl_config.get('stage2_steps', 2000)
+        stage0_steps = cl_config.get('stage0_steps', 5)  # 新增
+        stage1_steps = cl_config.get('stage1_steps', 15)
+        stage2_steps = cl_config.get('stage2_steps', 25)
         recursive_weight = cl_config.get('recursive_loss_weight', 0.2)
-        recursive_sampling_steps = cl_config.get('recursive_sampling_steps', 5)
+        recursive_sampling_steps = cl_config.get('recursive_sampling_steps', 20)
     else:
         if rank == 0:
             logger.warning("⚠️  未找到课程学习配置，使用默认值")
-        stage1_steps = 1000
-        stage2_steps = 2000
+        stage0_steps = 5
+        stage1_steps = 15
+        stage2_steps = 25
         recursive_weight = 0.2
-        recursive_sampling_steps = 5
+        recursive_sampling_steps = 20
 
     # 验证tar_num_frames
     if args.tar_num_frames != 3:
@@ -789,17 +836,17 @@ def main(args):
     # 打印配置
     if rank == 0:
         logger.info(f"\n{'='*60}")
-        logger.info(f"📚 三元组课程学习配置:")
-        logger.info(f"  阶段1: 0→{stage1_steps} steps, Gap=1, 3帧")
-        logger.info(f"  阶段2: {stage1_steps}→{stage2_steps} steps, Gap=2, 5帧")
-        logger.info(f"  阶段3: {stage2_steps}+ steps, Gap=4, 9帧")
+        logger.info(f"📚 四阶段课程学习配置:")
+        logger.info(f"  阶段0: 0→{stage0_steps} steps, Gap=1, 2帧, 伪GT+随机α")
+        logger.info(f"  阶段1: {stage0_steps}→{stage1_steps} steps, Gap=2, 3帧")
+        logger.info(f"  阶段2: {stage1_steps}→{stage2_steps} steps, Gap=4, 5帧")
+        logger.info(f"  阶段3: {stage2_steps}+ steps, Gap=8, 9帧")
         logger.info(f"  递归链权重: {recursive_weight}")
-        logger.info(f"  递归链采样: {recursive_sampling_steps}步DDIM")
         logger.info(f"  血管mask: {'启用' if vessel_mask_enable else '禁用'}")
-        logger.info(f"  显存优化: 混合精度={args.mixed_precision}, 梯度检查点={args.gradient_checkpointing}")
         logger.info(f"{'='*60}\n")
 
     # 存储到args
+    args.stage0_steps = stage0_steps
     args.stage1_steps = stage1_steps
     args.stage2_steps = stage2_steps
     args.recursive_weight = recursive_weight
@@ -946,10 +993,11 @@ def main(args):
         batch_size=args.train_batch_size,
         shuffle=False,
         sampler=sampler_train,
-        num_workers=args.num_workers,
+        # num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=2  # 预取优化
+        # prefetch_factor=2  # 预取优化
     )
 
     # 验证集
@@ -966,10 +1014,11 @@ def main(args):
         batch_size=args.val_batch_size,
         shuffle=False,
         sampler=sampler_val,
-        num_workers=args.num_workers,
+        # num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=2
+        # prefetch_factor=2
     )
 
     if rank == 0:
@@ -1136,22 +1185,44 @@ def main(args):
 
             # ========== 计算Loss（三元组 + 递归链） ==========
             with torch.cuda.amp.autocast(enabled=args.mixed_precision):
-                if stage == 1:
-                    base_loss = compute_triplet_loss(model, diffusion, latent, t, weight_batch, device)
+                if stage == 0:
+                    # 阶段0：直接用伪GT三元组（已包含随机α）
+                    base_loss = compute_triplet_loss(
+                        model, diffusion, latent, t, 
+                        weight_batch, device
+                    )
+                    loss = base_loss / args.gradient_accumulation_steps
+                    recursive_loss_value = 0.0
+                
+                elif stage == 1:
+                    base_loss = compute_triplet_loss(
+                        model, diffusion, latent, t, 
+                        weight_batch, device
+                    )
                     loss = base_loss / args.gradient_accumulation_steps
                     recursive_loss_value = 0.0
                 
                 elif stage == 2:
                     latent_sparse = torch.stack([latent[:, 0], latent[:, 2], latent[:, 4]], dim=1)
-                    base_loss = compute_triplet_loss(model, diffusion, latent_sparse, t, weight_batch, device)
-                    recursive_loss = compute_recursive_loss_stage2_lowmem(model, diffusion, latent, t, val_diffusion, device)
+                    base_loss = compute_triplet_loss(
+                        model, diffusion, latent_sparse, t, 
+                        weight_batch, device
+                    )
+                    recursive_loss = compute_recursive_loss_stage2_lowmem(
+                        model, diffusion, latent, t, val_diffusion, device
+                    )
                     loss = (base_loss + args.recursive_weight * recursive_loss) / args.gradient_accumulation_steps
                     recursive_loss_value = recursive_loss.item()
                 
                 else:  # stage == 3
                     latent_sparse = torch.stack([latent[:, 0], latent[:, 4], latent[:, 8]], dim=1)
-                    base_loss = compute_triplet_loss(model, diffusion, latent_sparse, t, weight_batch, device)
-                    recursive_loss = compute_recursive_loss_stage3_lowmem(model, diffusion, latent, t, val_diffusion, device)
+                    base_loss = compute_triplet_loss(
+                        model, diffusion, latent_sparse, t, 
+                        weight_batch, device
+                    )
+                    recursive_loss = compute_recursive_loss_stage3_lowmem(
+                        model, diffusion, latent, t, val_diffusion, device
+                    )
                     loss = (base_loss + args.recursive_weight * recursive_loss) / args.gradient_accumulation_steps
                     recursive_loss_value = recursive_loss.item()
 
@@ -1179,6 +1250,48 @@ def main(args):
                     opt.step()
                 lr_scheduler.step()
                 set_optimizer_zeros_grad(opt)
+                
+                # ✅ 调试：记录train_steps的变化
+                prev_train_steps = train_steps
+                train_steps += 1
+                
+                # ✅ 调试日志1：每次都打印（只在前100步）
+                if train_steps <= 100 and rank == 0:
+                    print(f"[DEBUG] Step {train_steps}: prev={prev_train_steps}, "
+                        f"stage0_steps={args.stage0_steps}, "
+                        f"stage1_steps={args.stage1_steps}")
+                
+                # 检查是否跨越了阶段边界
+                stage_changed = False
+                
+                # ✅ 调试日志2：检查每个条件
+                if prev_train_steps < args.stage0_steps <= train_steps:
+                    stage_changed = True
+                    if rank == 0:
+                        print(f"[DEBUG] 触发条件1: {prev_train_steps} < {args.stage0_steps} <= {train_steps}")
+                        logger.info(f"🎯 切换到 Stage 1 (Gap=2) at step {train_steps}")
+                
+                elif prev_train_steps < args.stage1_steps <= train_steps:
+                    stage_changed = True
+                    if rank == 0:
+                        print(f"[DEBUG] 触发条件2: {prev_train_steps} < {args.stage1_steps} <= {train_steps}")
+                        logger.info(f"🎯 ���换到 Stage 2 (Gap=4) at step {train_steps}")
+                
+                elif prev_train_steps < args.stage2_steps <= train_steps:
+                    stage_changed = True
+                    if rank == 0:
+                        print(f"[DEBUG] 触发条件3: {prev_train_steps} < {args.stage2_steps} <= {train_steps}")
+                        logger.info(f"🎯 切换到 Stage 3 (Gap=8) at step {train_steps}")
+                
+                # 阶段切换时更新dataset
+                if stage_changed:
+                    if rank == 0:
+                        print(f"[DEBUG] 正在更新dataset，train_steps={train_steps}")
+                    dataset_train.set_training_step(train_steps)
+                    if hasattr(dataset_val, 'set_training_step'):
+                        dataset_val.set_training_step(train_steps)
+                    if rank == 0:
+                        print(f"[DEBUG] Dataset已更新")
 
                 # EMA更新
                 ema_decay = get_ema_decay(train_steps, base_decay=0.9999, min_decay=0.99, warmup_steps=1000)
@@ -1303,15 +1416,18 @@ def main(args):
             )
             
             # 确定当前阶段需要验证的间隔
-            if train_steps < args.stage1_steps:
+            if train_steps < args.stage0_steps:
+                stage_name = "Stage0"
+                stage_weights = args.val_weights_config.get('stage0', {'interval_1': 1.0})
+            elif train_steps < args.stage1_steps:
                 stage_name = "Stage1"
-                stage_weights = args.val_weights_config.get('stage1', {'interval_1': 1.0})
+                stage_weights = args.val_weights_config.get('stage1', {'interval_2': 1.0})
             elif train_steps < args.stage2_steps:
                 stage_name = "Stage2"
-                stage_weights = args.val_weights_config.get('stage2', {'interval_1': 0.3, 'interval_2': 0.7})
+                stage_weights = args.val_weights_config.get('stage2', {'interval_2': 0.3, 'interval_4': 0.7})
             else:
                 stage_name = "Stage3"
-                stage_weights = args.val_weights_config.get('stage3', {'interval_1': 0.1, 'interval_2': 0.3, 'interval_4': 0.6})
+                stage_weights = args.val_weights_config.get('stage3', {'interval_2': 0.1, 'interval_4': 0.3, 'interval_8': 0.6})
 
             # 转换权重key格式: {'interval_1': 0.3} -> {1: 0.3}
             weights_dict = {int(k.split('_')[1]): v for k, v in stage_weights.items()}
