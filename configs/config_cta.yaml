@@ -75,7 +75,7 @@ curriculum_learning:
   
   # 递归链配置
   recursive_loss_weight: 0.2
-  recursive_sampling_steps: 20
+  recursive_sampling_steps: 50
   
   # 验证权重（修正后）
   val_weights:

@@ -1,4 +1,4 @@
-# ema+mask:可用，autodl训了19epoch
+# autodl
 import os
 # 临时开启expandable_segments（加载阶段用，训练时再关闭）
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -359,9 +359,14 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
     行4: 血管mask
     """
     b_val, f_val, c_val, h_val, w_val = video_val.shape
+
+    stage0_steps = 500
     
     # 确定当前阶段
-    if current_step < stage1_steps:
+    if current_step < stage0_steps:
+        print(f"⚠️  Epoch {epoch+1}: Stage0，跳过可视化")
+        return
+    elif current_step < stage1_steps:
         stage = 1
         stage_name = "Stage1_Gap1"
     elif current_step < stage2_steps:
@@ -462,9 +467,9 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
         decoded_base = decoded_base_gray.repeat(1, 1, 3, 1, 1)
         
         # 构建mask可视化（灰色遮罩）
-        mask_base_vis = torch.ones(b_val, 3, 3, h_val, w_val, device=device) * 0.5  # 灰色
-        mask_base_vis[:, :, 0, :, :] = 0  # 首帧不遮罩
-        mask_base_vis[:, :, 2, :, :] = 0  # 尾帧不遮罩
+        mask_base_vis = torch.ones(b_val, 3, 3, h_val, w_val, device=device) * 0.5
+        mask_base_vis[:, 0, :, :, :] = 0  # 第0帧（首帧）不遮罩
+        mask_base_vis[:, 2, :, :, :] = 0  # 第2帧（尾帧）不遮罩
         
         # 提取单个样本
         video_val_single = triplet_video_gt[sample_idx:sample_idx+1]
@@ -512,8 +517,14 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
                     raw_x=triplet_step1.permute(0, 2, 1, 3, 4),
                     mask=mask_step1
                 )
-                samples1 = samples1.permute(1, 0, 2, 3, 4)
-                predicted_s2_latent = samples1[:, 1, :, :, :].clone()
+                # samples1 = samples1.permute(1, 0, 2, 3, 4)
+                # predicted_s2_latent = samples1[:, 1, :, :, :].clone()
+                # 融合mask + permute回来
+                samples1 = samples1.permute(1, 0, 2, 3, 4) * mask_step1 + \
+                           triplet_step1.permute(2, 0, 1, 3, 4) * (1 - mask_step1)
+                samples1 = samples1.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W] ✅
+                
+                predicted_s2_latent = samples1[:, 1, :, :, :].clone()  # [B, C, H, W] ✅
                 
                 # 解码s+2
                 decoded_s2 = vae.decode(predicted_s2_latent / 0.18215).sample
@@ -533,8 +544,13 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
                     raw_x=triplet_step2.permute(0, 2, 1, 3, 4),
                     mask=mask_step1
                 )
-                samples2 = samples2.permute(1, 0, 2, 3, 4)
-                decoded_s1 = vae.decode(samples2[:, 1, :, :, :] / 0.18215).sample
+                # samples2 = samples2.permute(1, 0, 2, 3, 4)
+                # decoded_s1 = vae.decode(samples2[:, 1, :, :, :] / 0.18215).sample
+                samples2 = samples2.permute(1, 0, 2, 3, 4) * mask_step1 + \
+                           triplet_step2.permute(2, 0, 1, 3, 4) * (1 - mask_step1)
+                samples2 = samples2.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W] ✅
+                
+                decoded_s1 = vae.decode(samples2[:, 1, :, :, :] / 0.18215).sample  # ✅
                 decoded_s1_gray = decoded_s1.mean(dim=1, keepdim=True)
                 result_frames[1] = decoded_s1_gray.repeat(1, 3, 1, 1)
                 
@@ -549,8 +565,13 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
                     raw_x=triplet_step3.permute(0, 2, 1, 3, 4),
                     mask=mask_step1
                 )
-                samples3 = samples3.permute(1, 0, 2, 3, 4)
-                decoded_s3 = vae.decode(samples3[:, 1, :, :, :] / 0.18215).sample
+                # samples3 = samples3.permute(1, 0, 2, 3, 4)
+                # decoded_s3 = vae.decode(samples3[:, 1, :, :, :] / 0.18215).sample
+                samples3 = samples3.permute(1, 0, 2, 3, 4) * mask_step1 + \
+                           triplet_step3.permute(2, 0, 1, 3, 4) * (1 - mask_step1)
+                samples3 = samples3.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W] ✅
+                
+                decoded_s3 = vae.decode(samples3[:, 1, :, :, :] / 0.18215).sample  # ✅
                 decoded_s3_gray = decoded_s3.mean(dim=1, keepdim=True)
                 result_frames[3] = decoded_s3_gray.repeat(1, 3, 1, 1)
                 
@@ -559,31 +580,237 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
                 # 拼接5帧结果
                 result_video = torch.stack(result_frames, dim=1)  # [B, 5, C, H, W]
                 num_frames_rec = 5
-                
             else:  # stage == 3
-                # 阶段3递归链：9帧完整可视化（简化版，直接预测）
-                mask_rec_all = torch.ones(b_val, f_val, h_latent_val, w_latent_val, device=device)
-                mask_rec_all[:, 0, :, :] = 0
-                mask_rec_all[:, 8, :, :] = 0
+                # ✅ 阶段3递归链：完整版，逐层递归预测9帧
+                # 递归结构：
+                # 第1层：[0, 8] → 4
+                # 第2层：[0, 4] → 2, [4, 8] → 6
+                # 第3层：[0, 2] → 1, [2, 4] → 3, [4, 6] → 5, [6, 8] → 7
                 
-                z_rec = torch.randn_like(latent_val.permute(0, 2, 1, 3, 4))
-                samples_rec = val_diffusion.p_sample_loop(
-                    raw_model.forward, z_rec.shape, z_rec,
+                result_frames = [None] * 9
+                
+                # 预先填充GT帧
+                result_frames[0] = video_val[:, 0]  # frame_0 (GT)
+                result_frames[8] = video_val[:, 8]  # frame_8 (GT)
+                
+                # 通用mask（首尾可见，中间预测）
+                mask_triplet = torch.ones(b_val, 3, h_latent_val, w_latent_val, device=device)
+                mask_triplet[:, 0, :, :] = 0  # 首帧可见
+                mask_triplet[:, 2, :, :] = 0  # 尾帧可见
+                
+                # ========== 第1层：用[0, 8]预测4 ==========
+                triplet_l1 = torch.stack([
+                    latent_val[:, 0],   # frame_0
+                    latent_val[:, 4],   # frame_4（占位，将被预测）
+                    latent_val[:, 8]    # frame_8
+                ], dim=1)  # [B, 3, C, H, W]
+                
+                z_l1 = torch.randn_like(triplet_l1.permute(0, 2, 1, 3, 4))
+                samples_l1 = val_diffusion.p_sample_loop(
+                    raw_model.forward, z_l1.shape, z_l1,
                     clip_denoised=False, progress=False, device=device,
-                    raw_x=latent_val.permute(0, 2, 1, 3, 4),
-                    mask=mask_rec_all
+                    raw_x=triplet_l1.permute(0, 2, 1, 3, 4),
+                    mask=mask_triplet
                 )
                 
-                samples_rec = samples_rec.permute(1, 0, 2, 3, 4) * mask_rec_all + latent_val.permute(2, 0, 1, 3, 4) * (1 - mask_rec_all)
-                samples_rec = samples_rec.permute(1, 2, 0, 3, 4)
-                samples_rec_flat = rearrange(samples_rec, 'b f c h w -> (b f) c h w') / 0.18215
-                decoded_rec = vae.decode(samples_rec_flat).sample
-                decoded_rec = rearrange(decoded_rec, '(b f) c h w -> b f c h w', b=b_val)
-                decoded_rec_gray = decoded_rec.mean(dim=2, keepdim=True)
-                result_video = decoded_rec_gray.repeat(1, 1, 3, 1, 1)
+                # 融合+提取
+                samples_l1 = samples_l1.permute(1, 0, 2, 3, 4) * mask_triplet + \
+                             triplet_l1.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
+                samples_l1 = samples_l1.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W]
+                pred_4_latent = samples_l1[:, 1, :, :, :].clone()  # [B, C, H, W]
                 
+                # 解码frame_4
+                decoded_4 = vae.decode(pred_4_latent / 0.18215).sample
+                decoded_4_gray = decoded_4.mean(dim=1, keepdim=True)
+                result_frames[4] = decoded_4_gray.repeat(1, 3, 1, 1)
+                
+                del z_l1, samples_l1
+                torch.cuda.empty_cache()
+                # ========== 第2层：用[0, pred_4]预测2，用[pred_4, 8]预测6 ==========
+                # 预测frame_2
+                triplet_l2a = torch.stack([
+                    latent_val[:, 0],
+                    latent_val[:, 2],           # 占位
+                    pred_4_latent.detach()
+                ], dim=1)
+                
+                z_l2a = torch.randn_like(triplet_l2a.permute(0, 2, 1, 3, 4))
+                samples_l2a = val_diffusion.p_sample_loop(
+                    raw_model.forward, z_l2a.shape, z_l2a,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=triplet_l2a.permute(0, 2, 1, 3, 4),
+                    mask=mask_triplet
+                )
+                
+                samples_l2a = samples_l2a.permute(1, 0, 2, 3, 4) * mask_triplet + \
+                              triplet_l2a.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
+                samples_l2a = samples_l2a.permute(1, 2, 0, 3, 4)
+                pred_2_latent = samples_l2a[:, 1, :, :, :].clone()
+                
+                decoded_2 = vae.decode(pred_2_latent / 0.18215).sample
+                decoded_2_gray = decoded_2.mean(dim=1, keepdim=True)
+                result_frames[2] = decoded_2_gray.repeat(1, 3, 1, 1)
+                
+                del z_l2a, samples_l2a
+                torch.cuda.empty_cache()
+                # 预测frame_6
+                triplet_l2b = torch.stack([
+                    pred_4_latent.detach(),
+                    latent_val[:, 6],           # 占位
+                    latent_val[:, 8]
+                ], dim=1)
+                
+                z_l2b = torch.randn_like(triplet_l2b.permute(0, 2, 1, 3, 4))
+                samples_l2b = val_diffusion.p_sample_loop(
+                    raw_model.forward, z_l2b.shape, z_l2b,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=triplet_l2b.permute(0, 2, 1, 3, 4),
+                    mask=mask_triplet
+                )
+                
+                samples_l2b = samples_l2b.permute(1, 0, 2, 3, 4) * mask_triplet + \
+                              triplet_l2b.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
+                samples_l2b = samples_l2b.permute(1, 2, 0, 3, 4)
+                pred_6_latent = samples_l2b[:, 1, :, :, :].clone()
+                
+                decoded_6 = vae.decode(pred_6_latent / 0.18215).sample
+                decoded_6_gray = decoded_6.mean(dim=1, keepdim=True)
+                result_frames[6] = decoded_6_gray.repeat(1, 3, 1, 1)
+                
+                del z_l2b, samples_l2b
+                torch.cuda.empty_cache()
+                # ========== 第3层：预测1, 3, 5, 7 ==========
+                # 预测frame_1
+                triplet_l3a = torch.stack([
+                    latent_val[:, 0],
+                    latent_val[:, 1],           # 占位
+                    pred_2_latent.detach()
+                ], dim=1)
+                
+                z_l3a = torch.randn_like(triplet_l3a.permute(0, 2, 1, 3, 4))
+                samples_l3a = val_diffusion.p_sample_loop(
+                    raw_model.forward, z_l3a.shape, z_l3a,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=triplet_l3a.permute(0, 2, 1, 3, 4),
+                    mask=mask_triplet
+                )
+                
+                samples_l3a = samples_l3a.permute(1, 0, 2, 3, 4) * mask_triplet + \
+                              triplet_l3a.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
+                samples_l3a = samples_l3a.permute(1, 2, 0, 3, 4)
+                decoded_1 = vae.decode(samples_l3a[:, 1, :, :, :] / 0.18215).sample
+                decoded_1_gray = decoded_1.mean(dim=1, keepdim=True)
+                result_frames[1] = decoded_1_gray.repeat(1, 3, 1, 1)
+                
+                del z_l3a, samples_l3a
+                torch.cuda.empty_cache()
+                # 预测frame_3
+                triplet_l3b = torch.stack([
+                    pred_2_latent.detach(),
+                    latent_val[:, 3],           # 占位
+                    pred_4_latent.detach()
+                ], dim=1)
+                
+                z_l3b = torch.randn_like(triplet_l3b.permute(0, 2, 1, 3, 4))
+                samples_l3b = val_diffusion.p_sample_loop(
+                    raw_model.forward, z_l3b.shape, z_l3b,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=triplet_l3b.permute(0, 2, 1, 3, 4),
+                    mask=mask_triplet
+                )
+                
+                samples_l3b = samples_l3b.permute(1, 0, 2, 3, 4) * mask_triplet + \
+                              triplet_l3b.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
+                samples_l3b = samples_l3b.permute(1, 2, 0, 3, 4)
+                decoded_3 = vae.decode(samples_l3b[:, 1, :, :, :] / 0.18215).sample
+                decoded_3_gray = decoded_3.mean(dim=1, keepdim=True)
+                result_frames[3] = decoded_3_gray.repeat(1, 3, 1, 1)
+                
+                del z_l3b, samples_l3b
+                torch.cuda.empty_cache()
+                # 预测frame_5
+                triplet_l3c = torch.stack([
+                    pred_4_latent.detach(),
+                    latent_val[:, 5],           # 占位
+                    pred_6_latent.detach()
+                ], dim=1)
+                
+                z_l3c = torch.randn_like(triplet_l3c.permute(0, 2, 1, 3, 4))
+                samples_l3c = val_diffusion.p_sample_loop(
+                    raw_model.forward, z_l3c.shape, z_l3c,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=triplet_l3c.permute(0, 2, 1, 3, 4),
+                    mask=mask_triplet
+                )
+                
+                samples_l3c = samples_l3c.permute(1, 0, 2, 3, 4) * mask_triplet + \
+                              triplet_l3c.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
+                samples_l3c = samples_l3c.permute(1, 2, 0, 3, 4)
+                decoded_5 = vae.decode(samples_l3c[:, 1, :, :, :] / 0.18215).sample
+                decoded_5_gray = decoded_5.mean(dim=1, keepdim=True)
+                result_frames[5] = decoded_5_gray.repeat(1, 3, 1, 1)
+                
+                del z_l3c, samples_l3c
+                torch.cuda.empty_cache()
+                # 预测frame_7
+                triplet_l3d = torch.stack([
+                    pred_6_latent.detach(),
+                    latent_val[:, 7],           # 占位
+                    latent_val[:, 8]
+                ], dim=1)
+                
+                z_l3d = torch.randn_like(triplet_l3d.permute(0, 2, 1, 3, 4))
+                samples_l3d = val_diffusion.p_sample_loop(
+                    raw_model.forward, z_l3d.shape, z_l3d,
+                    clip_denoised=False, progress=False, device=device,
+                    raw_x=triplet_l3d.permute(0, 2, 1, 3, 4),
+                    mask=mask_triplet
+                )
+                
+                samples_l3d = samples_l3d.permute(1, 0, 2, 3, 4) * mask_triplet + \
+                              triplet_l3d.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
+                samples_l3d = samples_l3d.permute(1, 2, 0, 3, 4)
+                decoded_7 = vae.decode(samples_l3d[:, 1, :, :, :] / 0.18215).sample
+                decoded_7_gray = decoded_7.mean(dim=1, keepdim=True)
+                result_frames[7] = decoded_7_gray.repeat(1, 3, 1, 1)
+                
+                del z_l3d, samples_l3d, pred_2_latent, pred_4_latent, pred_6_latent
+                torch.cuda.empty_cache()
+                # 拼接9帧结果
+                result_video = torch.stack(result_frames, dim=1)  # [B, 9, 3, H, W]
                 num_frames_rec = 9
-                del z_rec, samples_rec
+
+                # # 构建9帧的GT和mask可视化
+                # video_val_rec = video_val[:, :9, :, :, :]
+                # vessel_mask_rec = vessel_mask_vis[:, :9, :, :, :]
+                
+                # mask_rec_vis = torch.ones(b_val, 9, 3, h_val, w_val, device=device) * 0.5  # 灰色
+                # mask_rec_vis[:, 0, :, :, :] = 0   # frame_0不遮罩（GT）
+                # mask_rec_vis[:, 8, :, :, :] = 0   # frame_8不遮罩（GT）
+            # else:  # stage == 3
+            #     # 阶段3递归链：9帧完整可视化（简化版，直接预测）
+            #     mask_rec_all = torch.ones(b_val, f_val, h_latent_val, w_latent_val, device=device)
+            #     mask_rec_all[:, 0, :, :] = 0
+            #     mask_rec_all[:, 8, :, :] = 0
+                
+            #     z_rec = torch.randn_like(latent_val.permute(0, 2, 1, 3, 4))
+            #     samples_rec = val_diffusion.p_sample_loop(
+            #         raw_model.forward, z_rec.shape, z_rec,
+            #         clip_denoised=False, progress=False, device=device,
+            #         raw_x=latent_val.permute(0, 2, 1, 3, 4),
+            #         mask=mask_rec_all
+            #     )
+                
+            #     samples_rec = samples_rec.permute(1, 0, 2, 3, 4) * mask_rec_all + latent_val.permute(2, 0, 1, 3, 4) * (1 - mask_rec_all)
+            #     samples_rec = samples_rec.permute(1, 2, 0, 3, 4)
+            #     samples_rec_flat = rearrange(samples_rec, 'b f c h w -> (b f) c h w') / 0.18215
+            #     decoded_rec = vae.decode(samples_rec_flat).sample
+            #     decoded_rec = rearrange(decoded_rec, '(b f) c h w -> b f c h w', b=b_val)
+            #     decoded_rec_gray = decoded_rec.mean(dim=2, keepdim=True)
+            #     result_video = decoded_rec_gray.repeat(1, 1, 3, 1, 1)
+                
+            #     num_frames_rec = 9
+            #     del z_rec, samples_rec
             
             # 构建递归链的mask可视化
             video_val_rec = video_val[:, :num_frames_rec, :, :, :]
@@ -1275,7 +1502,7 @@ def main(args):
                     stage_changed = True
                     if rank == 0:
                         print(f"[DEBUG] 触发条件2: {prev_train_steps} < {args.stage1_steps} <= {train_steps}")
-                        logger.info(f"🎯 ���换到 Stage 2 (Gap=4) at step {train_steps}")
+                        logger.info(f"🎯 切换到 Stage 2 (Gap=4) at step {train_steps}")
                 
                 elif prev_train_steps < args.stage2_steps <= train_steps:
                     stage_changed = True
@@ -1382,6 +1609,7 @@ def main(args):
             )
             
             with torch.no_grad():
+                dataset_val.set_training_step(train_steps)
                 # 只取验证集第一个batch
                 val_batch = next(iter(loader_val))
                 video_val = val_batch['video'].to(device)
@@ -1398,8 +1626,7 @@ def main(args):
                     raw_model=get_raw_model(model),  # 原始模型（解包DDP）
                     current_step=train_steps,
                     stage1_steps=args.stage1_steps,
-                    stage2_steps=args.stage2_steps,
-                    ema_model=ema                    # EMA模型（可选，传了就生成EMA的图）
+                    stage2_steps=args.stage2_steps  # EMA模型（可选，传了就生成EMA的图）
                 )
             
             model.train()  # 回到训练模式
@@ -1442,8 +1669,18 @@ def main(args):
             metrics_per_interval = {}
             
             for interval in intervals_to_validate:
-                # 临时设置dataset的间隔（模拟不同阶段）
-                temp_step = {1: 0, 2: args.stage1_steps, 4: args.stage2_steps}[interval]  # ✅ 使用配置
+                # temp_step映射（保持不变）
+                if interval == 1:
+                    temp_step = 0  # Stage 0（伪GT，2帧）
+                elif interval == 2:
+                    temp_step = max(0, args.stage1_steps - 1)  # Stage 1（3帧）
+                elif interval == 4:
+                    temp_step = max(0, args.stage2_steps - 1)  # Stage 2（5帧）
+                elif interval == 8:
+                    temp_step = max(0, args.stage2_steps)  # Stage 3（9帧）
+                else:
+                    raise ValueError(f"不支持的interval: {interval}")
+                    
                 dataset_val.set_training_step(temp_step)
                 
                 val_mae, val_mse, val_psnr = 0.0, 0.0, 0.0
@@ -1453,47 +1690,151 @@ def main(args):
                     for val_step, val_batch in enumerate(val_pbar):
                         video_val = val_batch['video'].to(device)
                         b_val, f_val, c_val, h_val, w_val = video_val.shape
+
+                        # ✅ 关键修改1：根据interval提取三元组索引
+                        start_idx = 0
+                        end_idx = f_val - 1
+                        mid_idx = (start_idx + end_idx) // 2
                         
-                        # VAE编码
-                        video_val_flat = rearrange(video_val, 'b f c h w -> (b f) c h w')
-                        latent_val = vae.encode(video_val_flat).latent_dist.sample().mul_(0.18215)
-                        latent_val = rearrange(latent_val, '(b f) c h w -> b f c h w', b=b_val)
+                        # 确保索引不越界
+                        end_idx = min(end_idx, f_val - 1)
+                        mid_idx = min(mid_idx, f_val - 1)
+
+                        # ✅ 添加调试（只在第一个batch）
+                        if val_step == 0:
+                            print(f"\n[DEBUG] Interval={interval}, f_val={f_val}")
+                            print(f"  索引: start={start_idx}, mid={mid_idx}, end={end_idx}")
                         
-                        # 构建mask（只有稀疏帧可见）
-                        _, _, _, h_latent_val, w_latent_val = latent_val.shape
-                        visible_idx = get_visible_frames(f_val, interval)
-                        mask_val = torch.ones(b_val, f_val, h_latent_val, w_latent_val, device=device)
-                        for idx in visible_idx:
-                            if idx < f_val:
-                                mask_val[:, idx, :, :] = 0.0
+                        # ✅ 验证索引合法性
+                        if mid_idx == start_idx or mid_idx == end_idx:
+                            if val_step == 0:
+                                print(f"  ⚠️  警告：帧数不足（f_val={f_val}），跳过")
+                            continue
+                
+                        # ✅ 关键修改2：提取三元组（而不是完整序列）
+                        triplet_video = torch.stack([
+                            video_val[:, start_idx],  # 首帧
+                            video_val[:, mid_idx],    # 中间帧（GT）
+                            video_val[:, end_idx]     # 尾帧
+                        ], dim=1)  # [B, 3, C, H, W]
                         
-                        # 采样生成
-                        z = torch.randn_like(latent_val.permute(0, 2, 1, 3, 4))
+                        # VAE编码（只编码3帧）
+                        triplet_flat = rearrange(triplet_video, 'b f c h w -> (b f) c h w')
+                        latent_triplet = vae.encode(triplet_flat).latent_dist.sample().mul_(0.18215)
+                        latent_triplet = rearrange(latent_triplet, '(b f) c h w -> b f c h w', b=b_val)
+                        # latent_triplet: [B, 3, C_latent, H_latent, W_latent] ✅
+                        
+                        # ✅ 关键修改3：构建mask（首尾可见，中间预测）
+                        _, _, _, h_latent_val, w_latent_val = latent_triplet.shape
+                        mask_val = torch.zeros(b_val, 3, h_latent_val, w_latent_val, device=device)
+                        mask_val[:, 1, :, :] = 1.0  # 中间帧需要预测
+
+                        # ✅ 添加：验证mask
+                        if val_step == 0:
+                            print(f"  mask_val形状: {mask_val.shape}")
+                            print(f"  mask_val（首帧）: {mask_val[:, 0].sum()}")  # 应该=0
+                            print(f"  mask_val（中间）: {mask_val[:, 1].sum()}")  # 应该>0
+                            print(f"  mask_val（尾帧）: {mask_val[:, 2].sum()}")  # 应该=0
+                        # ✅ 采样生成（只处理3帧）
+                        z = torch.randn_like(latent_triplet.permute(0, 2, 1, 3, 4))
                         samples = val_diffusion.p_sample_loop(
                             get_raw_model(model).forward,
-                            z.shape,
+                            z.shape,  # [B, C, 3, H, W] ✅
                             z,
-                            clip_denoised=False,
+                            clip_denoised=True,
                             progress=False,
                             device=device,
-                            raw_x=latent_val.permute(0, 2, 1, 3, 4),
+                            raw_x=latent_triplet.permute(0, 2, 1, 3, 4),
                             mask=mask_val
                         )
+
+                        # ✅ 修改2：显式clip采样结果
+                        samples = samples.permute(1, 0, 2, 3, 4)  # [3, B, C, H, W]
                         
+                        # 调试输出
+                        if val_step == 0:
+                            print(f"  采样后（clip前）: [{samples.min():.4f}, {samples.max():.4f}]")
+                            print(f"    首帧: [{samples[0].min():.4f}, {samples[0].max():.4f}]")
+                            print(f"    中间: [{samples[1].min():.4f}, {samples[1].max():.4f}]")
+                            print(f"    尾帧: [{samples[2].min():.4f}, {samples[2].max():.4f}]")
+                        
+                        # Clip到合理范围（latent通常在[-5, 5]）
+                        samples = torch.clamp(samples, -5.0, 5.0)
+                        
+                        if val_step == 0:
+                            print(f"  Clip后: [{samples.min():.4f}, {samples.max():.4f}]")
+                        
+                        # 融合（首尾帧保留GT，中间帧使用预测）
+                        mask_val_expanded = mask_val.unsqueeze(1)  # [B, 1, 3, H, W]
+                        latent_triplet_reordered = latent_triplet.permute(2, 0, 1, 3, 4)  # [3, B, C, H, W]
+
                         # 解码
-                        samples = samples.permute(1, 0, 2, 3, 4) * mask_val + latent_val.permute(2, 0, 1, 3, 4) * (1 - mask_val)
-                        samples = samples.permute(1, 2, 0, 3, 4)
+                        samples = samples.permute(1, 0, 2, 3, 4) * mask_val + \
+                                  latent_triplet.permute(2, 0, 1, 3, 4) * (1 - mask_val)
+                        # ✅ 修改3：强制保留首尾帧（确保不会被采样结果污染）
+                        samples[0] = latent_triplet_reordered[0]  # 首帧
+                        samples[2] = latent_triplet_reordered[2]  # 尾帧
+
+                        samples = samples.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W]
+
+                        # ✅ 添加：检查首尾帧是否被保留
+                        if val_step == 0:
+                            # 解码前检查latent
+                            print(f"  融合后latent（首帧）: [{samples[:, 0].min():.4f}, {samples[:, 0].max():.4f}]")
+                            print(f"  融合后latent（中间）: [{samples[:, 1].min():.4f}, {samples[:, 1].max():.4f}]")
+                            print(f"  融合后latent（尾帧）: [{samples[:, 2].min():.4f}, {samples[:, 2].max():.4f}]")
+                            
+                            print(f"  GT latent（首帧）: [{latent_triplet[:, 0].min():.4f}, {latent_triplet[:, 0].max():.4f}]")
+                            print(f"  GT latent（尾帧）: [{latent_triplet[:, 2].min():.4f}, {latent_triplet[:, 2].max():.4f}]")
+    
                         samples_flat = rearrange(samples, 'b f c h w -> (b f) c h w') / 0.18215
                         decoded = vae.decode(samples_flat).sample
                         decoded = rearrange(decoded, '(b f) c h w -> b f c h w', b=b_val)
+
+                        # ✅ 添加：检查解码后的首尾帧
+                        if val_step == 0:
+                            print(f"  解码后（首帧）: [{decoded[:, 0].min():.4f}, {decoded[:, 0].max():.4f}]")
+                            print(f"  解码后（中间）: [{decoded[:, 1].min():.4f}, {decoded[:, 1].max():.4f}]")
+                            print(f"  解码后（尾帧）: [{decoded[:, 2].min():.4f}, {decoded[:, 2].max():.4f}]")
+                            
+                            print(f"  GT（首帧）: [{triplet_video[:, 0].min():.4f}, {triplet_video[:, 0].max():.4f}]")
+                            print(f"  GT（尾帧）: [{triplet_video[:, 2].min():.4f}, {triplet_video[:, 2].max():.4f}]")
+
+                        # ✅ 添加：clip到合理范围
+                        decoded = torch.clamp(decoded, -1.0, 1.0)
+                        # ✅ 添加：强制保留首尾帧的pixel值
+                        decoded[:, 0, :, :, :] = triplet_video[:, 0, :, :, :].clone()
+                        decoded[:, 2, :, :, :] = triplet_video[:, 2, :, :, :].clone()
                         
+                        # 调试输出
+                        if val_step == 0:
+                            print(f"  强制保留后（首帧）: [{decoded[:, 0].min():.4f}, {decoded[:, 0].max():.4f}]")
+                            print(f"  强制保留后（尾帧）: [{decoded[:, 2].min():.4f}, {decoded[:, 2].max():.4f}]")
+                            
                         # 强制转灰度
                         decoded_gray = decoded.mean(dim=2, keepdim=True)
-                        decoded = decoded_gray.repeat(1, 1, 3, 1, 1)
+                        decoded = decoded_gray.repeat(1, 1, 3, 1, 1)  # [B, 3, 3, H, W]
+                        # ✅ 确保GT也是3通道
+                        if triplet_video.shape[2] == 1:
+                            triplet_video = triplet_video.repeat(1, 1, 3, 1, 1)
                         
-                        # 计算指标
-                        gt_np = video_val.detach().cpu().numpy()
-                        pred_np = decoded.detach().cpu().numpy()
+                        # ✅ 关键修改4：只计算中间帧的指标
+                        gt_middle = triplet_video[:, 1, :, :, :]  # [B, C, H, W]
+                        pred_middle = decoded[:, 1, :, :, :]       # [B, C, H, W]
+
+                        # ✅ 添加调试输出
+                        if val_step == 0:  # 只在第一个batch打印
+                            print(f"\n[DEBUG] Interval={interval}")
+                            print(f"  GT: [{gt_middle.min():.4f}, {gt_middle.max():.4f}], mean={gt_middle.mean():.4f}")
+                            print(f"  Pred: [{pred_middle.min():.4f}, {pred_middle.max():.4f}], mean={pred_middle.mean():.4f}")
+                            
+                        # 计算指标（只针对中间帧）
+                        gt_np = gt_middle.detach().cpu().numpy()
+                        pred_np = pred_middle.detach().cpu().numpy()
+
+                        # ✅ 动态计算data_range
+                        data_range = max(gt_np.max() - gt_np.min(), 2.0)  # 至少为2.0
+
                         val_mae += np.mean(np.abs(pred_np - gt_np)) / len(loader_val)
                         val_mse += mean_squared_error(gt_np.reshape(-1), pred_np.reshape(-1)) / len(loader_val)
                         val_psnr += peak_signal_noise_ratio(gt_np, pred_np, data_range=2.0) / len(loader_val)
@@ -1582,4 +1923,3 @@ if __name__ == "__main__":
     parser.add_argument("--vessel_max_weight", type=float, default=10.0, help="Max weight for vessel region (default: 10)")
     args = parser.parse_args()
     main(OmegaConf.load(args.config))
-
