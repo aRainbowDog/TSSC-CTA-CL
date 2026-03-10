@@ -4,18 +4,30 @@ import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import math
 import argparse
+import logging
+from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from torchvision.utils import save_image
-from tqdm import tqdm
 from glob import glob
 from time import time
 from copy import deepcopy
 from einops import rearrange
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from models.model_dit import MVIF_models
-from models.diffusion.gaussian_diffusion import create_diffusion
+from models.diffusion.gaussian_diffusion import create_diffusion, ModelMeanType
 from dataloader.data_loader_acdc import data_loader
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -25,7 +37,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from utils.utils import (
     clip_grad_norm_, create_logger, update_ema, requires_grad, 
-    cleanup, create_tensorboard, write_tensorboard, setup_distributed
+    cleanup, create_experiment_tracker, write_experiment_metric,
+    write_experiment_images, close_experiment_tracker, setup_distributed
 )
 from skimage.metrics import mean_squared_error, peak_signal_noise_ratio
 import warnings
@@ -35,6 +48,94 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from skimage.filters import apply_hysteresis_threshold
 warnings.filterwarnings('ignore')
+
+
+def log_debug(logger, *lines):
+    if logger is None or not logger.isEnabledFor(logging.DEBUG):
+        return
+    for line in lines:
+        logger.debug(line)
+
+
+def create_logger_compat(logging_dir, level="INFO"):
+    """Support both old and new create_logger signatures."""
+    try:
+        return create_logger(logging_dir, level=level)
+    except TypeError:
+        logger = create_logger(logging_dir)
+        resolved_level = getattr(logging, str(level).upper(), logging.INFO)
+        logger.setLevel(resolved_level)
+        for handler in logger.handlers:
+            handler.setLevel(resolved_level)
+        return logger
+
+
+def distributed_barrier():
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()
+
+
+def create_rich_progress(console=None):
+    return Progress(
+        SpinnerColumn(style="bold blue"),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=28),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn("{task.fields[status]}", justify="left"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console or Console(stderr=True),
+        transient=False,
+        expand=True,
+        refresh_per_second=4,
+    )
+
+
+def get_stage_metadata(train_steps, args):
+    if train_steps < args.stage0_steps:
+        return {"stage": 0, "gap": 1, "frames": 2, "next": f"s1@{args.stage0_steps}"}
+    if train_steps < args.stage1_steps:
+        return {"stage": 1, "gap": 2, "frames": 3, "next": f"s2@{args.stage1_steps}"}
+    if train_steps < args.stage2_steps:
+        return {"stage": 2, "gap": 4, "frames": 5, "next": f"s3@{args.stage2_steps}"}
+    return {"stage": 3, "gap": 8, "frames": 9, "next": "done"}
+
+
+def format_overall_progress_status(epoch, num_train_epochs, train_steps, args):
+    meta = get_stage_metadata(train_steps, args)
+    return (
+        f"epoch {epoch + 1}/{num_train_epochs} | "
+        f"opt {train_steps}/{args.max_train_steps} | "
+        f"s{meta['stage']} g{meta['gap']} f{meta['frames']} | "
+        f"next {meta['next']}"
+    )
+
+
+def format_epoch_progress_status(
+        batch_step,
+        total_batches,
+        train_steps,
+        max_train_steps,
+        stage=None,
+        frame_gap=None,
+        num_frames=None,
+        loss_value=None,
+        recursive_loss_value=None,
+        grad_norm=None):
+    status = [
+        f"batch {batch_step}/{total_batches}",
+        f"opt {train_steps}/{max_train_steps}",
+    ]
+    if stage is not None and frame_gap is not None and num_frames is not None:
+        status.append(f"s{stage} g{frame_gap} f{num_frames}")
+    if loss_value is not None:
+        status.append(f"loss {loss_value:.4f}")
+    if recursive_loss_value is not None:
+        status.append(f"rec {recursive_loss_value:.4f}")
+    if grad_norm is not None:
+        status.append(f"gn {grad_norm:.4f}")
+    return " | ".join(status)
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
     """
@@ -145,6 +246,12 @@ def prepare_mask_for_latent(soft_weight_np, latent_size, device):
 def get_raw_model(model):
     """获取DDP包装后的原始模型，若无DDP则返回原模型"""
     return model.module if hasattr(model, 'module') else model
+
+
+def ddp_sync_context(model, should_sync):
+    if isinstance(model, DDP) and not should_sync:
+        return model.no_sync()
+    return nullcontext()
 
 # ========== 新增：课程学习辅助函数 ==========
 def get_visible_frames(total_frames, interval):
@@ -349,7 +456,7 @@ def get_ema_decay(train_steps, base_decay=0.9999, min_decay=0.99, warmup_steps=1
 def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, val_fold, 
                                           generate_vessel_mask_adaptive, raw_model, 
                                           current_step, stage1_steps, stage2_steps,
-                                          ema_model=None):
+                                          ema_model=None, logger=None):
     """
     (epoch, video_val, vae, val_diffusion, device, val_fold, generate_vessel_mask_adaptive, raw_model, ema_model=None)
     三元组验证可视化（4行完整版）
@@ -364,8 +471,11 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
     
     # 确定当前阶段
     if current_step < stage0_steps:
-        print(f"⚠️  Epoch {epoch+1}: Stage0，跳过可视化")
-        return
+        if logger is not None:
+            logger.warning(f"Epoch {epoch+1}: Stage0，跳过可视化")
+        else:
+            print(f"⚠️  Epoch {epoch+1}: Stage0，跳过可视化")
+        return {}
     elif current_step < stage1_steps:
         stage = 1
         stage_name = "Stage1_Gap1"
@@ -486,16 +596,27 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
         ], dim=1)
         
         val_pic_base_flat = rearrange(val_pic_base, 'b f c h w -> (b f) c h w')
+        base_image_path = os.path.join(val_fold, f"Epoch_{epoch+1}_{stage_name}_base_triplet.png")
         save_image(
             val_pic_base_flat,
-            os.path.join(val_fold, f"Epoch_{epoch+1}_{stage_name}_base_triplet.png"),
+            base_image_path,
             nrow=3,  # 3列（三元组）
             normalize=True,
             value_range=(-1, 1)
         )
         
-        print(f"✅ Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}）")
+        if logger is not None:
+            logger.info(f"Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}）")
+        else:
+            print(f"✅ Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}）")
         del z, samples_base, decoded_base
+
+    generated_images = {
+        "Val Examples/BaseTriplet": {
+            "path": base_image_path,
+            "caption": f"Epoch {epoch+1} {stage_name} base triplet",
+        }
+    }
     
     # ========== 2. 递归链预测（逐层细化，完整帧序列） ==========
     if stage >= 2:  # 阶段2和3才有递归链
@@ -835,22 +956,95 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
             ], dim=1)
             
             val_pic_rec_flat = rearrange(val_pic_rec, 'b f c h w -> (b f) c h w')
+            recursive_image_path = os.path.join(val_fold, f"Epoch_{epoch+1}_{stage_name}_recursive_full.png")
             save_image(
                 val_pic_rec_flat,
-                os.path.join(val_fold, f"Epoch_{epoch+1}_{stage_name}_recursive_full.png"),
+                recursive_image_path,
                 nrow=num_frames_rec,  # 5帧或9帧
                 normalize=True,
                 value_range=(-1, 1)
             )
             
-            print(f"✅ Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部）")
+            if logger is not None:
+                logger.info(f"Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部）")
+            else:
+                print(f"✅ Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部）")
+            generated_images["Val Examples/Recursive"] = {
+                "path": recursive_image_path,
+                "caption": f"Epoch {epoch+1} {stage_name} recursive {num_frames_rec} frames",
+            }
     
     torch.cuda.empty_cache()
+    return generated_images
 
 # ========== 三元组loss计算函数 ==========
-def compute_triplet_loss(model, diffusion, latent_triplet, t, weight_batch=None, device=None):
+def resolve_triplet_loss_pair(
+    diffusion,
+    pred_middle_raw,
+    x_t_middle,
+    x_start_middle,
+    noise_middle,
+    t,
+    loss_target_mode="auto",
+):
+    """Resolve prediction/target tensors for the requested triplet loss mode."""
+    if loss_target_mode == "auto":
+        if diffusion.model_mean_type == ModelMeanType.EPSILON:
+            return pred_middle_raw, noise_middle
+        if diffusion.model_mean_type == ModelMeanType.START_X:
+            return pred_middle_raw, x_start_middle
+        if diffusion.model_mean_type == ModelMeanType.PREVIOUS_X:
+            target_prev, _, _ = diffusion.q_posterior_mean_variance(
+                x_start=x_start_middle,
+                x_t=x_t_middle,
+                t=t,
+            )
+            return pred_middle_raw, target_prev
+        raise NotImplementedError(f"Unsupported model_mean_type: {diffusion.model_mean_type}")
+
+    if loss_target_mode == "epsilon":
+        if diffusion.model_mean_type != ModelMeanType.EPSILON:
+            raise ValueError(
+                "loss_target_mode='epsilon' requires diffusion.model_mean_type == ModelMeanType.EPSILON"
+            )
+        return pred_middle_raw, noise_middle
+
+    if loss_target_mode == "x0":
+        if diffusion.model_mean_type == ModelMeanType.EPSILON:
+            pred_middle = diffusion._predict_xstart_from_eps(
+                x_t=x_t_middle,
+                t=t,
+                eps=pred_middle_raw,
+            )
+        elif diffusion.model_mean_type == ModelMeanType.START_X:
+            pred_middle = pred_middle_raw
+        else:
+            raise NotImplementedError(
+                f"loss_target_mode='x0' is not implemented for {diffusion.model_mean_type}"
+            )
+        return pred_middle, x_start_middle
+
+    raise ValueError(
+        f"Unsupported loss_target_mode: {loss_target_mode}. Expected one of: auto, epsilon, x0"
+    )
+
+
+def compute_triplet_loss(
+    model,
+    diffusion,
+    latent_triplet,
+    t,
+    weight_batch=None,
+    device=None,
+    loss_target_mode="auto",
+):
     """
-    计算三元组loss（首尾可见，预测中间）- 修正版
+    计算三元组loss（首尾可见，预测中间）。
+
+    loss_target_mode:
+        - auto: follow diffusion.model_mean_type
+        - epsilon: compare predicted noise against noise target
+        - x0: compare predicted x0 against clean latent target
     """
     b, f, c, h, w = latent_triplet.shape
     assert f == 3, f"必须是三元组，当前{f}帧"
@@ -879,19 +1073,20 @@ def compute_triplet_loss(model, diffusion, latent_triplet, t, weight_batch=None,
     if model_output.shape[2] == c * 2:  # 如果输出通道数是输入的2倍（learn_sigma=True）
         model_output, _ = torch.split(model_output, c, dim=2)  # 分离均值和方差，取均值
     
-    # 提取中间帧的预测和目标
-    pred_middle = model_output[:, 1, :, :, :]  # [B, C, H, W]
-    
-    # 目标是原始的latent（去噪后的）
-    if diffusion.model_mean_type == 0:  # EPSILON（预测噪声）
-        # 从噪声预测x0
-        target_middle = diffusion._predict_xstart_from_eps(
-            x_t=x_t.permute(0, 2, 1, 3, 4)[:, :, 1, :, :],  # [B, C, H, W]
-            t=t,
-            eps=noise.permute(0, 2, 1, 3, 4)[:, :, 1, :, :]
-        )
-    else:  # START_X（直接预测x0）
-        target_middle = latent_triplet[:, 1, :, :, :]  # [B, C, H, W]
+    pred_middle_raw = model_output[:, 1, :, :, :]  # [B, C, H, W]
+    x_t_middle = x_t[:, 1, :, :, :]  # [B, C, H, W]
+    noise_middle = noise.permute(0, 2, 1, 3, 4)[:, 1, :, :, :]  # [B, C, H, W]
+    x_start_middle = latent_triplet[:, 1, :, :, :]  # [B, C, H, W]
+
+    pred_middle, target_middle = resolve_triplet_loss_pair(
+        diffusion=diffusion,
+        pred_middle_raw=pred_middle_raw,
+        x_t_middle=x_t_middle,
+        x_start_middle=x_start_middle,
+        noise_middle=noise_middle,
+        t=t,
+        loss_target_mode=loss_target_mode,
+    )
     
     # 计算MSE loss
     loss_middle = (pred_middle - target_middle) ** 2  # [B, C, H, W]
@@ -930,72 +1125,88 @@ def fast_predict_middle_frame(model, val_diffusion, triplet_latent, mask, device
     
     return predicted_middle
 
-# ========== 阶段2递归链loss ==========
-def compute_recursive_loss_stage2_lowmem(model, diffusion, latent_dense, t, val_diffusion, device):
-    """阶段2递归链（修正版）"""
+def backward_loss(loss, scaler=None, mixed_precision=True):
+    """Backward a scaled or unscaled loss tensor."""
+    if mixed_precision:
+        scaler.scale(loss).backward()
+    else:
+        loss.backward()
+
+
+def build_stage2_recursive_triplets(latent_dense):
+    """Build the extra recursive triplets used in stage2, excluding the base triplet."""
     b, f, c, h, w = latent_dense.shape
     assert f == 5, f"阶段2需要5帧，当前{f}帧"
-    
-    losses = []
-    mask_triplet = torch.ones(b, 3, h, w, device=device)
-    mask_triplet[:, 0, :, :] = 0
-    mask_triplet[:, 2, :, :] = 0
-    
-    # 第1步：预测s+2
-    triplet_step1 = torch.stack([latent_dense[:, 0], latent_dense[:, 2], latent_dense[:, 4]], dim=1)
-    
-    # 调用修正后的compute_triplet_loss
-    loss1 = compute_triplet_loss(model, diffusion, triplet_step1, t, None, device)
-    losses.append(loss1)
-    
-    # 第2步：用预测的s+2预测s+1（简化：直接用GT的s+2）
-    triplet_step2 = torch.stack([latent_dense[:, 0], latent_dense[:, 1], latent_dense[:, 2]], dim=1)
-    loss2 = compute_triplet_loss(model, diffusion, triplet_step2, t, None, device)
-    losses.append(loss2)
-    
-    # 第3步：预测s+3
-    triplet_step3 = torch.stack([latent_dense[:, 2], latent_dense[:, 3], latent_dense[:, 4]], dim=1)
-    loss3 = compute_triplet_loss(model, diffusion, triplet_step3, t, None, device)
-    losses.append(loss3)
-    
-    torch.cuda.empty_cache()
-    return torch.stack(losses).mean()
+    return [
+        torch.stack([latent_dense[:, 0], latent_dense[:, 1], latent_dense[:, 2]], dim=1),
+        torch.stack([latent_dense[:, 2], latent_dense[:, 3], latent_dense[:, 4]], dim=1),
+    ]
 
-# ========== 阶段3递归链loss ==========
-def compute_recursive_loss_stage3_lowmem(model, diffusion, latent_dense, t, val_diffusion, device):
-    """阶段3递归链（修正版）"""
+
+def build_stage3_recursive_triplets(latent_dense):
+    """Build the extra recursive triplets used in stage3, excluding the base triplet."""
     b, f, c, h, w = latent_dense.shape
     assert f == 9, f"阶段3需要9帧，当前{f}帧"
-    
-    losses = []
-    
-    # 第1层：预测s+4
-    triplet_l1 = torch.stack([latent_dense[:, 0], latent_dense[:, 4], latent_dense[:, 8]], dim=1)
-    losses.append(compute_triplet_loss(model, diffusion, triplet_l1, t, None, device))
-    
-    # 第2层：预测s+2和s+6
-    triplet_l2_left = torch.stack([latent_dense[:, 0], latent_dense[:, 2], latent_dense[:, 4]], dim=1)
-    losses.append(compute_triplet_loss(model, diffusion, triplet_l2_left, t, None, device))
-    
-    triplet_l2_right = torch.stack([latent_dense[:, 4], latent_dense[:, 6], latent_dense[:, 8]], dim=1)
-    losses.append(compute_triplet_loss(model, diffusion, triplet_l2_right, t, None, device))
-    
-    # 第3层：预测s+1, s+3, s+5, s+7
-    for left, mid, right in [(0,1,2), (2,3,4), (4,5,6), (6,7,8)]:
-        triplet = torch.stack([latent_dense[:, left], latent_dense[:, mid], latent_dense[:, right]], dim=1)
-        losses.append(compute_triplet_loss(model, diffusion, triplet, t, None, device))
-    
+    triplets = [
+        torch.stack([latent_dense[:, 0], latent_dense[:, 2], latent_dense[:, 4]], dim=1),
+        torch.stack([latent_dense[:, 4], latent_dense[:, 6], latent_dense[:, 8]], dim=1),
+    ]
+    for left, mid, right in [(0, 1, 2), (2, 3, 4), (4, 5, 6), (6, 7, 8)]:
+        triplets.append(torch.stack([latent_dense[:, left], latent_dense[:, mid], latent_dense[:, right]], dim=1))
+    return triplets
+
+
+def backward_recursive_triplets(
+    model,
+    diffusion,
+    triplets,
+    t,
+    device,
+    recursive_weight,
+    loss_scale_divisor,
+    scaler=None,
+    mixed_precision=True,
+    loss_target_mode="auto",
+    sync_last_backward=False,
+):
+    """
+    Backward each recursive triplet immediately to reduce peak memory.
+    Returns the mean recursive loss value for logging.
+    """
+    if not triplets:
+        return 0.0
+
+    loss_sum = 0.0
+    scaled_weight = recursive_weight / (len(triplets) * loss_scale_divisor)
+
+    for idx, triplet in enumerate(triplets):
+        should_sync = sync_last_backward and idx == len(triplets) - 1
+        with ddp_sync_context(model, should_sync=should_sync):
+            triplet_loss = compute_triplet_loss(
+                model,
+                diffusion,
+                triplet,
+                t,
+                None,
+                device,
+                loss_target_mode=loss_target_mode,
+            )
+            loss_sum += triplet_loss.detach().item()
+            backward_loss(
+                scaled_weight * triplet_loss,
+                scaler=scaler,
+                mixed_precision=mixed_precision,
+            )
+            del triplet_loss
+
     torch.cuda.empty_cache()
-    return torch.stack(losses).mean()
+    return loss_sum / len(triplets)
 
 # -------------------------- 主训练函数（修改loss计算部分） --------------------------
 def main(args):
     # 1. 基础校验与分布式初始化
     assert torch.cuda.is_available(), "Training requires at least one GPU."
-    setup_distributed(backend="nccl")  # 初始化分布式环境
-    rank = dist.get_rank()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = dist.get_world_size()
+    rank, local_rank, world_size = setup_distributed(backend="nccl")  # 初始化分布式环境
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)  # 绑定当前进程到local_rank对应的GPU
 
@@ -1015,19 +1226,44 @@ def main(args):
     experiment_dir = f"{args.results_dir}/{model_string_name}_{args.cur_date}"
     checkpoint_dir = f"{experiment_dir}/checkpoints"
     val_fold = f"{experiment_dir}/val_pic"
+    log_level = str(getattr(args, "log_level", "INFO")).upper()
+    valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    if log_level not in valid_log_levels:
+        raise ValueError(f"log_level must be one of {sorted(valid_log_levels)}, got {log_level}")
+    args.log_level = log_level
+    tracking_backend = str(getattr(args, "tracking_backend", "tensorboard")).lower()
+    valid_tracking_backends = {"tensorboard", "wandb"}
+    if tracking_backend not in valid_tracking_backends:
+        raise ValueError(
+            f"tracking_backend must be one of {sorted(valid_tracking_backends)}, got {tracking_backend}"
+        )
+    args.tracking_backend = tracking_backend
+    wandb_project = getattr(args, "wandb_project", "TSSC-CTA-CL")
+    wandb_entity = getattr(args, "wandb_entity", None)
+    wandb_mode = str(getattr(args, "wandb_mode", "online")).lower()
+    wandb_run_name = getattr(args, "wandb_run_name", None) or os.path.basename(experiment_dir)
     
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(val_fold, exist_ok=True)
-        logger = create_logger(experiment_dir)
-        tb_writer = create_tensorboard(os.path.join(experiment_dir, 'runs'))
+        logger = create_logger_compat(experiment_dir, level=log_level)
+        tracker = create_experiment_tracker(
+            backend=tracking_backend,
+            logging_dir=os.path.join(experiment_dir, "runs") if tracking_backend == "tensorboard" else experiment_dir,
+            run_name=wandb_run_name,
+            config=OmegaConf.to_container(args, resolve=True),
+            project=wandb_project,
+            entity=wandb_entity,
+            mode=wandb_mode,
+        )
         OmegaConf.save(args, os.path.join(experiment_dir, 'config_cta.yaml'))
         logger.info(f"Experiment dir: {experiment_dir}")
         logger.info(f"World size: {world_size}, Rank: {rank}, Local rank: {local_rank}")
+        logger.info(f"Tracking backend: {tracking_backend}")
     else:
-        logger = create_logger(None)
-        tb_writer = None
+        logger = create_logger_compat(None, level=log_level)
+        tracker = None
 
     # ========== 读取课程学习配置 ==========
     if hasattr(args, 'curriculum_learning') and args.curriculum_learning is not None:
@@ -1060,6 +1296,14 @@ def main(args):
         vessel_max_weight = 10.0
         vessel_mask_enable = True
 
+    triplet_loss_mode = getattr(args, 'triplet_loss_mode', 'auto')
+    valid_triplet_loss_modes = {'auto', 'epsilon', 'x0'}
+    if triplet_loss_mode not in valid_triplet_loss_modes:
+        raise ValueError(
+            f"triplet_loss_mode must be one of {sorted(valid_triplet_loss_modes)}, got {triplet_loss_mode}"
+        )
+    args.triplet_loss_mode = triplet_loss_mode
+
     # 打印配置
     if rank == 0:
         logger.info(f"\n{'='*60}")
@@ -1070,6 +1314,7 @@ def main(args):
         logger.info(f"  阶段3: {stage2_steps}+ steps, Gap=8, 9帧")
         logger.info(f"  递归链权重: {recursive_weight}")
         logger.info(f"  血管mask: {'启用' if vessel_mask_enable else '禁用'}")
+        logger.info(f"  三元组loss模式: {triplet_loss_mode}")
         logger.info(f"{'='*60}\n")
 
     # 存储到args
@@ -1183,11 +1428,15 @@ def main(args):
             device_ids=[local_rank],
             output_device=local_rank,
             find_unused_parameters=False,
-            broadcast_buffers=True
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
         )
+    with torch.no_grad():
+        update_ema(ema, get_raw_model(model), decay=0.0)
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Model parameters: {total_params:,}")
+        logger.info(f"DDP memory opts | gradient_as_bucket_view={'on' if world_size > 1 else 'off'} | adamw_foreach=off")
 
     # 9. 优化器与学习率调度器
     opt = torch.optim.AdamW(
@@ -1195,7 +1444,8 @@ def main(args):
         lr=args.learning_rate,
         weight_decay=0,
         betas=(0.9, 0.999),
-        eps=1e-8
+        eps=1e-8,
+        foreach=False,
     )
 
     lr_scheduler = get_scheduler(
@@ -1226,32 +1476,29 @@ def main(args):
         drop_last=True,
         # prefetch_factor=2  # 预取优化
     )
+    train_batches_per_epoch = len(loader_train)
+    train_updates_per_epoch = max(1, math.ceil(train_batches_per_epoch / args.gradient_accumulation_steps))
 
     # 验证集
     dataset_val = data_loader(args, stage='val')
-    sampler_val = DistributedSampler(
-        dataset_val,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=False,
-        seed=args.global_seed
-    )
-    loader_val = DataLoader(
-        dataset_val,
-        batch_size=args.val_batch_size,
-        shuffle=False,
-        sampler=sampler_val,
-        # num_workers=args.num_workers,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=True,
-        # prefetch_factor=2
-    )
+    loader_val = None
+    if rank == 0:
+        loader_val = DataLoader(
+            dataset_val,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            # num_workers=args.num_workers,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False,
+            # prefetch_factor=2
+        )
 
     if rank == 0:
         logger.info(f"Train dataset size: {len(dataset_train)}")
         logger.info(f"Val dataset size: {len(dataset_val)}")
-        logger.info(f"Train steps per epoch: {math.ceil(len(loader_train))}")
+        logger.info(f"Train batches per epoch: {train_batches_per_epoch}")
+        logger.info(f"Train optimizer steps per epoch: {train_updates_per_epoch}")
 
     # ========== 断点续训核心优化（终极版） ==========
     # 强制清理所有冗余显存
@@ -1288,24 +1535,19 @@ def main(args):
             # 4. 读取元数据（核心修复：先赋值train_steps）
             train_steps = checkpoint.get("train_steps", 0)  # 先拿到checkpoint里的训练步数
             best_val_metric = checkpoint.get("best_val_metric", float('inf'))
-            
-            # ========== 核心修复：正确计算epoch和step ==========
-            # 梯度累积步数（从args读取，避免硬编码）
-            grad_accum = args.gradient_accumulation_steps
-            # 1. 把优化器步数转换回原始batch数（优化器步数 × 梯度累积步数）
-            total_batch_steps = train_steps * grad_accum
-            # 2. 每个epoch的总batch数
-            batches_per_epoch = len(loader_train)
-            
-            # 3. 计算真实的epoch和剩余batch数
-            if total_batch_steps >= batches_per_epoch:
-                # 已完成完整epoch，续训到下一个epoch的第一步
-                first_epoch = total_batch_steps // batches_per_epoch
+
+            saved_epoch = checkpoint.get("epoch", None)
+            if saved_epoch is not None:
+                first_epoch = int(saved_epoch)
                 resume_step = 0
             else:
-                # 未完成当前epoch，续训到剩余batch
-                first_epoch = 0
-                resume_step = total_batch_steps
+                # 兼容旧checkpoint：按每epoch的优化器步数近似反推
+                grad_accum = args.gradient_accumulation_steps
+                batches_per_epoch = len(loader_train)
+                updates_per_epoch = max(1, math.ceil(batches_per_epoch / grad_accum))
+                first_epoch = train_steps // updates_per_epoch
+                resume_updates = train_steps % updates_per_epoch
+                resume_step = min(resume_updates * grad_accum, batches_per_epoch)
             
             # 加载历史最优指标
             if best_val_metric != float('inf') and rank == 0:
@@ -1319,7 +1561,7 @@ def main(args):
             # 打印正确的续训日志
             if rank == 0:
                 logger.info(f"Resumed actual epoch: {first_epoch}, batch step: {resume_step}")
-                logger.info(f"Total trained batches: {total_batch_steps}/{batches_per_epoch}")
+                logger.info(f"Resumed optimizer steps: {train_steps}")
                 logger.info(f"Memory after load: {torch.cuda.memory_allocated(device)/1024**3:.2f} GiB")
                 logger.warning("跳过了优化器状态加载，优化器将从头开始（学习率不变）")
         else:
@@ -1348,7 +1590,7 @@ def main(args):
     torch.cuda.ipc_collect()
 
     # 12. 训练循环
-    num_update_steps_per_epoch = math.ceil(len(loader_train))
+    num_update_steps_per_epoch = train_updates_per_epoch
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
     model.train()
     ema.eval()  # EMA始终保持eval模式
@@ -1359,6 +1601,31 @@ def main(args):
     if rank == 0:
         logger.info(f"Start training for {num_train_epochs} epochs (first epoch: {first_epoch})")
         logger.info(f"Vessel mask max weight: {getattr(args, 'vessel_max_weight', 10.0)}")
+
+    train_progress = None
+    overall_task = None
+    epoch_task = None
+    if rank == 0:
+        initial_epoch_completed = resume_step if args.resume_from_checkpoint and first_epoch < num_train_epochs else 0
+        train_progress = create_rich_progress()
+        train_progress.start()
+        overall_task = train_progress.add_task(
+            "Overall Opt Step",
+            total=args.max_train_steps,
+            completed=train_steps,
+            status=format_overall_progress_status(first_epoch, num_train_epochs, train_steps, args),
+        )
+        epoch_task = train_progress.add_task(
+            f"Epoch {first_epoch + 1}/{num_train_epochs} Batch",
+            total=len(loader_train),
+            completed=initial_epoch_completed,
+            status=format_epoch_progress_status(
+                batch_step=initial_epoch_completed,
+                total_batches=len(loader_train),
+                train_steps=train_steps,
+                max_train_steps=args.max_train_steps,
+            ),
+        )
 
     for epoch in range(first_epoch, num_train_epochs):
         sampler_train.set_epoch(epoch)  # 分布式采样器epoch同步
@@ -1374,12 +1641,29 @@ def main(args):
         )
         diffusion.training = True
 
-        pbar = tqdm(loader_train, total=len(loader_train), desc=f"Rank{rank} Epoch {epoch + 1}", disable=(rank != 0))
-        for step, batch in enumerate(pbar):
+        if rank == 0 and train_progress is not None:
+            epoch_completed = resume_step if args.resume_from_checkpoint and epoch == first_epoch else 0
+            train_progress.update(
+                overall_task,
+                completed=train_steps,
+                status=format_overall_progress_status(epoch, num_train_epochs, train_steps, args),
+            )
+            train_progress.update(
+                epoch_task,
+                description=f"Epoch {epoch + 1}/{num_train_epochs} Batch",
+                total=len(loader_train),
+                completed=epoch_completed,
+                status=format_epoch_progress_status(
+                    batch_step=epoch_completed,
+                    total_batches=len(loader_train),
+                    train_steps=train_steps,
+                    max_train_steps=args.max_train_steps,
+                ),
+            )
+
+        for step, batch in enumerate(loader_train):
             # 跳过断点续训的步骤
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                train_steps += 1
-                pbar.update(1)
                 continue
 
             # ========== 数据加载 ==========
@@ -1410,57 +1694,109 @@ def main(args):
                     weight_list.append(weight_latent)
                 weight_batch = torch.cat(weight_list, dim=0).squeeze(1).repeat(1, c_latent, 1, 1)
 
+            should_step = (
+                ((step + 1) % args.gradient_accumulation_steps == 0)
+                or ((step + 1) == len(loader_train))
+            )
+            accum_divisor = args.gradient_accumulation_steps
+            if should_step and (step + 1) % args.gradient_accumulation_steps != 0:
+                accum_divisor = (step % args.gradient_accumulation_steps) + 1
+
             # ========== 计算Loss（三元组 + 递归链） ==========
+            recursive_loss_value = 0.0
+            loss_display_value = None
+            grad_norm_value = None
             with torch.cuda.amp.autocast(enabled=args.mixed_precision):
                 if stage == 0:
-                    # 阶段0：直接用伪GT三元组（已包含随机α）
-                    base_loss = compute_triplet_loss(
-                        model, diffusion, latent, t, 
-                        weight_batch, device
-                    )
-                    loss = base_loss / args.gradient_accumulation_steps
-                    recursive_loss_value = 0.0
+                    with ddp_sync_context(model, should_sync=should_step):
+                        base_loss = compute_triplet_loss(
+                            model, diffusion, latent, t, 
+                            weight_batch, device,
+                            loss_target_mode=args.triplet_loss_mode,
+                        )
+                        loss_display_value = base_loss.detach().item()
+                        loss = base_loss / accum_divisor
+                        backward_loss(loss, scaler=scaler, mixed_precision=args.mixed_precision)
                 
                 elif stage == 1:
-                    base_loss = compute_triplet_loss(
-                        model, diffusion, latent, t, 
-                        weight_batch, device
-                    )
-                    loss = base_loss / args.gradient_accumulation_steps
-                    recursive_loss_value = 0.0
+                    with ddp_sync_context(model, should_sync=should_step):
+                        base_loss = compute_triplet_loss(
+                            model, diffusion, latent, t, 
+                            weight_batch, device,
+                            loss_target_mode=args.triplet_loss_mode,
+                        )
+                        loss_display_value = base_loss.detach().item()
+                        loss = base_loss / accum_divisor
+                        backward_loss(loss, scaler=scaler, mixed_precision=args.mixed_precision)
                 
                 elif stage == 2:
                     latent_sparse = torch.stack([latent[:, 0], latent[:, 2], latent[:, 4]], dim=1)
-                    base_loss = compute_triplet_loss(
-                        model, diffusion, latent_sparse, t, 
-                        weight_batch, device
+                    with ddp_sync_context(model, should_sync=False):
+                        base_loss = compute_triplet_loss(
+                            model, diffusion, latent_sparse, t, 
+                            weight_batch, device,
+                            loss_target_mode=args.triplet_loss_mode,
+                        )
+                        base_loss_value = base_loss.detach().item()
+                        backward_loss(
+                            base_loss / accum_divisor,
+                            scaler=scaler,
+                            mixed_precision=args.mixed_precision,
+                        )
+                    recursive_triplets = build_stage2_recursive_triplets(latent)
+                    recursive_loss_value = backward_recursive_triplets(
+                        model,
+                        diffusion,
+                        recursive_triplets,
+                        t,
+                        device,
+                        recursive_weight=args.recursive_weight,
+                        loss_scale_divisor=accum_divisor,
+                        scaler=scaler,
+                        mixed_precision=args.mixed_precision,
+                        loss_target_mode=args.triplet_loss_mode,
+                        sync_last_backward=should_step,
                     )
-                    recursive_loss = compute_recursive_loss_stage2_lowmem(
-                        model, diffusion, latent, t, val_diffusion, device
-                    )
-                    loss = (base_loss + args.recursive_weight * recursive_loss) / args.gradient_accumulation_steps
-                    recursive_loss_value = recursive_loss.item()
+                    total_loss_value = base_loss_value + args.recursive_weight * recursive_loss_value
+                    loss_display_value = total_loss_value
+                    loss = torch.tensor(total_loss_value / accum_divisor, device=device)
+                    del recursive_triplets, base_loss
                 
                 else:  # stage == 3
                     latent_sparse = torch.stack([latent[:, 0], latent[:, 4], latent[:, 8]], dim=1)
-                    base_loss = compute_triplet_loss(
-                        model, diffusion, latent_sparse, t, 
-                        weight_batch, device
+                    with ddp_sync_context(model, should_sync=False):
+                        base_loss = compute_triplet_loss(
+                            model, diffusion, latent_sparse, t, 
+                            weight_batch, device,
+                            loss_target_mode=args.triplet_loss_mode,
+                        )
+                        base_loss_value = base_loss.detach().item()
+                        backward_loss(
+                            base_loss / accum_divisor,
+                            scaler=scaler,
+                            mixed_precision=args.mixed_precision,
+                        )
+                    recursive_triplets = build_stage3_recursive_triplets(latent)
+                    recursive_loss_value = backward_recursive_triplets(
+                        model,
+                        diffusion,
+                        recursive_triplets,
+                        t,
+                        device,
+                        recursive_weight=args.recursive_weight,
+                        loss_scale_divisor=accum_divisor,
+                        scaler=scaler,
+                        mixed_precision=args.mixed_precision,
+                        loss_target_mode=args.triplet_loss_mode,
+                        sync_last_backward=should_step,
                     )
-                    recursive_loss = compute_recursive_loss_stage3_lowmem(
-                        model, diffusion, latent, t, val_diffusion, device
-                    )
-                    loss = (base_loss + args.recursive_weight * recursive_loss) / args.gradient_accumulation_steps
-                    recursive_loss_value = recursive_loss.item()
-
-            # ========== 反向传播（保持原逻辑） ==========
-            if args.mixed_precision:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+                    total_loss_value = base_loss_value + args.recursive_weight * recursive_loss_value
+                    loss_display_value = total_loss_value
+                    loss = torch.tensor(total_loss_value / accum_divisor, device=device)
+                    del recursive_triplets, base_loss
 
             # 梯度裁剪（累计到指定步数）
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+            if should_step:
                 if args.mixed_precision:
                     scaler.unscale_(opt)
                 grad_norm = clip_grad_norm_(
@@ -1468,6 +1804,7 @@ def main(args):
                     args.clip_max_norm,
                     clip_grad=(train_steps >= args.start_clip_iter)
                 )
+                grad_norm_value = float(grad_norm)
 
                 # 优化器步进
                 if args.mixed_precision:
@@ -1484,9 +1821,11 @@ def main(args):
                 
                 # ✅ 调试日志1：每次都打印（只在前100步）
                 if train_steps <= 100 and rank == 0:
-                    print(f"[DEBUG] Step {train_steps}: prev={prev_train_steps}, "
+                    logger.debug(
+                        f"Step {train_steps}: prev={prev_train_steps}, "
                         f"stage0_steps={args.stage0_steps}, "
-                        f"stage1_steps={args.stage1_steps}")
+                        f"stage1_steps={args.stage1_steps}"
+                    )
                 
                 # 检查是否跨越了阶段边界
                 stage_changed = False
@@ -1495,30 +1834,30 @@ def main(args):
                 if prev_train_steps < args.stage0_steps <= train_steps:
                     stage_changed = True
                     if rank == 0:
-                        print(f"[DEBUG] 触发条件1: {prev_train_steps} < {args.stage0_steps} <= {train_steps}")
+                        logger.debug(f"触发条件1: {prev_train_steps} < {args.stage0_steps} <= {train_steps}")
                         logger.info(f"🎯 切换到 Stage 1 (Gap=2) at step {train_steps}")
                 
                 elif prev_train_steps < args.stage1_steps <= train_steps:
                     stage_changed = True
                     if rank == 0:
-                        print(f"[DEBUG] 触发条件2: {prev_train_steps} < {args.stage1_steps} <= {train_steps}")
+                        logger.debug(f"触发条件2: {prev_train_steps} < {args.stage1_steps} <= {train_steps}")
                         logger.info(f"🎯 切换到 Stage 2 (Gap=4) at step {train_steps}")
                 
                 elif prev_train_steps < args.stage2_steps <= train_steps:
                     stage_changed = True
                     if rank == 0:
-                        print(f"[DEBUG] 触发条件3: {prev_train_steps} < {args.stage2_steps} <= {train_steps}")
+                        logger.debug(f"触发条件3: {prev_train_steps} < {args.stage2_steps} <= {train_steps}")
                         logger.info(f"🎯 切换到 Stage 3 (Gap=8) at step {train_steps}")
                 
                 # 阶段切换时更新dataset
                 if stage_changed:
                     if rank == 0:
-                        print(f"[DEBUG] 正在更新dataset，train_steps={train_steps}")
+                        logger.debug(f"正在更新dataset，train_steps={train_steps}")
                     dataset_train.set_training_step(train_steps)
                     if hasattr(dataset_val, 'set_training_step'):
                         dataset_val.set_training_step(train_steps)
                     if rank == 0:
-                        print(f"[DEBUG] Dataset已更新")
+                        logger.debug("Dataset已更新")
 
                 # EMA更新
                 ema_decay = get_ema_decay(train_steps, base_decay=0.9999, min_decay=0.99, warmup_steps=1000)
@@ -1526,19 +1865,8 @@ def main(args):
                     update_ema(ema, get_raw_model(model), decay=ema_decay)
 
                 # 日志记录
-                running_loss += loss.item() * args.gradient_accumulation_steps
+                running_loss += loss.item() * accum_divisor
                 log_steps += 1
-                train_steps += 1
-
-                # 打印进度（添加阶段和递归loss信息）
-                pbar.set_postfix({
-                    "loss": f"{loss.item():.4f}",
-                    "s": stage,
-                    "g": frame_gap,
-                    "f": f,
-                    "rec": f"{recursive_loss_value:.4f}",
-                    "gn": f"{grad_norm:.4f}"
-                })
 
                 # 定期日志
                 if train_steps % args.log_every == 0 and rank == 0:
@@ -1549,19 +1877,44 @@ def main(args):
                         f"Loss: {avg_loss:.4f} | Rec Loss: {recursive_loss_value:.4f} | "
                         f"Grad Norm: {grad_norm:.4f} | Steps/Sec: {steps_per_sec:.2f}"
                     )
-                    write_tensorboard(tb_writer, 'Train/Loss', avg_loss, train_steps)
-                    write_tensorboard(tb_writer, 'Train/RecursiveLoss', recursive_loss_value, train_steps)
-                    write_tensorboard(tb_writer, 'Train/Stage', stage, train_steps)
-                    write_tensorboard(tb_writer, 'Train/GradNorm', grad_norm, train_steps)
-                    write_tensorboard(tb_writer, 'Train/LR', opt.param_groups[0]['lr'], train_steps)
-                    write_tensorboard(tb_writer, 'Train/EMADecay', ema_decay, train_steps)
+                    write_experiment_metric(tracker, args.tracking_backend, 'Train/Loss', avg_loss, train_steps)
+                    write_experiment_metric(tracker, args.tracking_backend, 'Train/RecursiveLoss', recursive_loss_value, train_steps)
+                    write_experiment_metric(tracker, args.tracking_backend, 'Train/Stage', stage, train_steps)
+                    write_experiment_metric(tracker, args.tracking_backend, 'Train/GradNorm', grad_norm, train_steps)
+                    write_experiment_metric(tracker, args.tracking_backend, 'Train/LR', opt.param_groups[0]['lr'], train_steps)
+                    write_experiment_metric(tracker, args.tracking_backend, 'Train/EMADecay', ema_decay, train_steps)
                     running_loss = 0.0
                     log_steps = 0
                     start_time = time()
 
+            if rank == 0 and train_progress is not None:
+                train_progress.update(
+                    epoch_task,
+                    completed=step + 1,
+                    status=format_epoch_progress_status(
+                        batch_step=step + 1,
+                        total_batches=len(loader_train),
+                        train_steps=train_steps,
+                        max_train_steps=args.max_train_steps,
+                        stage=stage,
+                        frame_gap=frame_gap,
+                        num_frames=f,
+                        loss_value=loss_display_value,
+                        recursive_loss_value=recursive_loss_value,
+                        grad_norm=grad_norm_value,
+                    ),
+                )
+                train_progress.update(
+                    overall_task,
+                    completed=train_steps,
+                    status=format_overall_progress_status(epoch, num_train_epochs, train_steps, args),
+                )
+
             # 终止条件
             if train_steps >= args.max_train_steps:
                 break
+
+        distributed_barrier()
 
         # ========== 每10个epoch保存模型 ==========
         if rank == 0 and (epoch + 1) % 10 == 0:
@@ -1586,6 +1939,7 @@ def main(args):
                 "model": get_raw_model(model).state_dict(),
                 "ema": ema.state_dict(),
                 "train_steps": train_steps,
+                "epoch": epoch + 1,
                 "best_val_metric": best_val_metric
             }
             torch.save(checkpoint, f"{checkpoint_dir}/latest_epoch_train_model.pth")
@@ -1615,7 +1969,7 @@ def main(args):
                 video_val = val_batch['video'].to(device)
                 
                 # 调用可视化函数（同时传raw model和EMA model）
-                save_val_sample_visualization(
+                val_example_images = save_val_sample_visualization(
                     epoch=epoch,
                     video_val=video_val,
                     vae=vae,
@@ -1626,7 +1980,14 @@ def main(args):
                     raw_model=get_raw_model(model),  # 原始模型（解包DDP）
                     current_step=train_steps,
                     stage1_steps=args.stage1_steps,
-                    stage2_steps=args.stage2_steps  # EMA模型（可选，传了就生成EMA的图）
+                    stage2_steps=args.stage2_steps,  # EMA模型（可选，传了就生成EMA的图）
+                    logger=logger,
+                )
+                write_experiment_images(
+                    tracker,
+                    args.tracking_backend,
+                    val_example_images,
+                    step=train_steps,
                 )
             
             model.train()  # 回到训练模式
@@ -1684,10 +2045,20 @@ def main(args):
                 dataset_val.set_training_step(temp_step)
                 
                 val_mae, val_mse, val_psnr = 0.0, 0.0, 0.0
-                val_pbar = tqdm(loader_val, total=len(loader_val), desc=f"Val Interval={interval}")
+                val_task = None
+                if train_progress is not None:
+                    val_task = train_progress.add_task(
+                        f"Val Interval {interval}",
+                        total=len(loader_val),
+                        completed=0,
+                        status=(
+                            f"epoch {epoch + 1}/{num_train_epochs} | "
+                            f"{stage_name} | batch 0/{len(loader_val)}"
+                        ),
+                    )
                 
                 with torch.no_grad():
-                    for val_step, val_batch in enumerate(val_pbar):
+                    for val_step, val_batch in enumerate(loader_val):
                         video_val = val_batch['video'].to(device)
                         b_val, f_val, c_val, h_val, w_val = video_val.shape
 
@@ -1702,13 +2073,16 @@ def main(args):
 
                         # ✅ 添加调试（只在第一个batch）
                         if val_step == 0:
-                            print(f"\n[DEBUG] Interval={interval}, f_val={f_val}")
-                            print(f"  索引: start={start_idx}, mid={mid_idx}, end={end_idx}")
+                            log_debug(
+                                logger,
+                                f"Interval={interval}, f_val={f_val}",
+                                f"  索引: start={start_idx}, mid={mid_idx}, end={end_idx}",
+                            )
                         
                         # ✅ 验证索引合法性
                         if mid_idx == start_idx or mid_idx == end_idx:
                             if val_step == 0:
-                                print(f"  ⚠️  警告：帧数不足（f_val={f_val}），跳过")
+                                logger.warning(f"帧数不足（f_val={f_val}），跳过 interval={interval}")
                             continue
                 
                         # ✅ 关键修改2：提取三元组（而不是完整序列）
@@ -1731,10 +2105,13 @@ def main(args):
 
                         # ✅ 添加：验证mask
                         if val_step == 0:
-                            print(f"  mask_val形状: {mask_val.shape}")
-                            print(f"  mask_val（首帧）: {mask_val[:, 0].sum()}")  # 应该=0
-                            print(f"  mask_val（中间）: {mask_val[:, 1].sum()}")  # 应该>0
-                            print(f"  mask_val（尾帧）: {mask_val[:, 2].sum()}")  # 应该=0
+                            log_debug(
+                                logger,
+                                f"  mask_val形状: {mask_val.shape}",
+                                f"  mask_val（首帧）: {mask_val[:, 0].sum()}",
+                                f"  mask_val（中间）: {mask_val[:, 1].sum()}",
+                                f"  mask_val（尾帧）: {mask_val[:, 2].sum()}",
+                            )
                         # ✅ 采样生成（只处理3帧）
                         z = torch.randn_like(latent_triplet.permute(0, 2, 1, 3, 4))
                         samples = val_diffusion.p_sample_loop(
@@ -1748,44 +2125,39 @@ def main(args):
                             mask=mask_val
                         )
 
-                        # ✅ 修改2：显式clip采样结果
-                        samples = samples.permute(1, 0, 2, 3, 4)  # [3, B, C, H, W]
+                        # 保持采样结果为 [B, C, F, H, W]，避免在帧/通道维之间来回切换
+                        samples = torch.clamp(samples, -5.0, 5.0)
                         
                         # 调试输出
                         if val_step == 0:
-                            print(f"  采样后（clip前）: [{samples.min():.4f}, {samples.max():.4f}]")
-                            print(f"    首帧: [{samples[0].min():.4f}, {samples[0].max():.4f}]")
-                            print(f"    中间: [{samples[1].min():.4f}, {samples[1].max():.4f}]")
-                            print(f"    尾帧: [{samples[2].min():.4f}, {samples[2].max():.4f}]")
-                        
-                        # Clip到合理范围（latent通常在[-5, 5]）
-                        samples = torch.clamp(samples, -5.0, 5.0)
+                            log_debug(
+                                logger,
+                                f"  采样后: [{samples.min():.4f}, {samples.max():.4f}]",
+                                f"    首帧: [{samples[:, :, 0].min():.4f}, {samples[:, :, 0].max():.4f}]",
+                                f"    中间: [{samples[:, :, 1].min():.4f}, {samples[:, :, 1].max():.4f}]",
+                                f"    尾帧: [{samples[:, :, 2].min():.4f}, {samples[:, :, 2].max():.4f}]",
+                            )
                         
                         if val_step == 0:
-                            print(f"  Clip后: [{samples.min():.4f}, {samples.max():.4f}]")
+                            log_debug(logger, f"  Clip后: [{samples.min():.4f}, {samples.max():.4f}]")
                         
                         # 融合（首尾帧保留GT，中间帧使用预测）
-                        mask_val_expanded = mask_val.unsqueeze(1)  # [B, 1, 3, H, W]
-                        latent_triplet_reordered = latent_triplet.permute(2, 0, 1, 3, 4)  # [3, B, C, H, W]
-
-                        # 解码
-                        samples = samples.permute(1, 0, 2, 3, 4) * mask_val + \
-                                  latent_triplet.permute(2, 0, 1, 3, 4) * (1 - mask_val)
-                        # ✅ 修改3：强制保留首尾帧（确保不会被采样结果污染）
-                        samples[0] = latent_triplet_reordered[0]  # 首帧
-                        samples[2] = latent_triplet_reordered[2]  # 尾帧
-
-                        samples = samples.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W]
+                        latent_triplet_bcfhw = latent_triplet.permute(0, 2, 1, 3, 4)
+                        samples = samples * mask_val.unsqueeze(1) + latent_triplet_bcfhw * (1 - mask_val.unsqueeze(1))
+                        samples[:, :, 0, :, :] = latent_triplet_bcfhw[:, :, 0, :, :]
+                        samples[:, :, 2, :, :] = latent_triplet_bcfhw[:, :, 2, :, :]
+                        samples = samples.permute(0, 2, 1, 3, 4)  # [B, 3, C, H, W]
 
                         # ✅ 添加：检查首尾帧是否被保留
                         if val_step == 0:
-                            # 解码前检查latent
-                            print(f"  融合后latent（首帧）: [{samples[:, 0].min():.4f}, {samples[:, 0].max():.4f}]")
-                            print(f"  融合后latent（中间）: [{samples[:, 1].min():.4f}, {samples[:, 1].max():.4f}]")
-                            print(f"  融合后latent（尾帧）: [{samples[:, 2].min():.4f}, {samples[:, 2].max():.4f}]")
-                            
-                            print(f"  GT latent（首帧）: [{latent_triplet[:, 0].min():.4f}, {latent_triplet[:, 0].max():.4f}]")
-                            print(f"  GT latent（尾帧）: [{latent_triplet[:, 2].min():.4f}, {latent_triplet[:, 2].max():.4f}]")
+                            log_debug(
+                                logger,
+                                f"  融合后latent（首帧）: [{samples[:, 0].min():.4f}, {samples[:, 0].max():.4f}]",
+                                f"  融合后latent（中间）: [{samples[:, 1].min():.4f}, {samples[:, 1].max():.4f}]",
+                                f"  融合后latent（尾帧）: [{samples[:, 2].min():.4f}, {samples[:, 2].max():.4f}]",
+                                f"  GT latent（首帧）: [{latent_triplet[:, 0].min():.4f}, {latent_triplet[:, 0].max():.4f}]",
+                                f"  GT latent（尾帧）: [{latent_triplet[:, 2].min():.4f}, {latent_triplet[:, 2].max():.4f}]",
+                            )
     
                         samples_flat = rearrange(samples, 'b f c h w -> (b f) c h w') / 0.18215
                         decoded = vae.decode(samples_flat).sample
@@ -1793,12 +2165,14 @@ def main(args):
 
                         # ✅ 添加：检查解码后的首尾帧
                         if val_step == 0:
-                            print(f"  解码后（首帧）: [{decoded[:, 0].min():.4f}, {decoded[:, 0].max():.4f}]")
-                            print(f"  解码后（中间）: [{decoded[:, 1].min():.4f}, {decoded[:, 1].max():.4f}]")
-                            print(f"  解码后（尾帧）: [{decoded[:, 2].min():.4f}, {decoded[:, 2].max():.4f}]")
-                            
-                            print(f"  GT（首帧）: [{triplet_video[:, 0].min():.4f}, {triplet_video[:, 0].max():.4f}]")
-                            print(f"  GT（尾帧）: [{triplet_video[:, 2].min():.4f}, {triplet_video[:, 2].max():.4f}]")
+                            log_debug(
+                                logger,
+                                f"  解码后（首帧）: [{decoded[:, 0].min():.4f}, {decoded[:, 0].max():.4f}]",
+                                f"  解码后（中间）: [{decoded[:, 1].min():.4f}, {decoded[:, 1].max():.4f}]",
+                                f"  解码后（尾帧）: [{decoded[:, 2].min():.4f}, {decoded[:, 2].max():.4f}]",
+                                f"  GT（首帧）: [{triplet_video[:, 0].min():.4f}, {triplet_video[:, 0].max():.4f}]",
+                                f"  GT（尾帧）: [{triplet_video[:, 2].min():.4f}, {triplet_video[:, 2].max():.4f}]",
+                            )
 
                         # ✅ 添加：clip到合理范围
                         decoded = torch.clamp(decoded, -1.0, 1.0)
@@ -1808,8 +2182,11 @@ def main(args):
                         
                         # 调试输出
                         if val_step == 0:
-                            print(f"  强制保留后（首帧）: [{decoded[:, 0].min():.4f}, {decoded[:, 0].max():.4f}]")
-                            print(f"  强制保留后（尾帧）: [{decoded[:, 2].min():.4f}, {decoded[:, 2].max():.4f}]")
+                            log_debug(
+                                logger,
+                                f"  强制保留后（首帧）: [{decoded[:, 0].min():.4f}, {decoded[:, 0].max():.4f}]",
+                                f"  强制保留后（尾帧）: [{decoded[:, 2].min():.4f}, {decoded[:, 2].max():.4f}]",
+                            )
                             
                         # 强制转灰度
                         decoded_gray = decoded.mean(dim=2, keepdim=True)
@@ -1824,9 +2201,12 @@ def main(args):
 
                         # ✅ 添加调试输出
                         if val_step == 0:  # 只在第一个batch打印
-                            print(f"\n[DEBUG] Interval={interval}")
-                            print(f"  GT: [{gt_middle.min():.4f}, {gt_middle.max():.4f}], mean={gt_middle.mean():.4f}")
-                            print(f"  Pred: [{pred_middle.min():.4f}, {pred_middle.max():.4f}], mean={pred_middle.mean():.4f}")
+                            log_debug(
+                                logger,
+                                f"Interval={interval}",
+                                f"  GT: [{gt_middle.min():.4f}, {gt_middle.max():.4f}], mean={gt_middle.mean():.4f}",
+                                f"  Pred: [{pred_middle.min():.4f}, {pred_middle.max():.4f}], mean={pred_middle.mean():.4f}",
+                            )
                             
                         # 计算指标（只针对中间帧）
                         gt_np = gt_middle.detach().cpu().numpy()
@@ -1838,6 +2218,19 @@ def main(args):
                         val_mae += np.mean(np.abs(pred_np - gt_np)) / len(loader_val)
                         val_mse += mean_squared_error(gt_np.reshape(-1), pred_np.reshape(-1)) / len(loader_val)
                         val_psnr += peak_signal_noise_ratio(gt_np, pred_np, data_range=2.0) / len(loader_val)
+
+                        if val_task is not None:
+                            train_progress.update(
+                                val_task,
+                                completed=val_step + 1,
+                                status=(
+                                    f"epoch {epoch + 1}/{num_train_epochs} | "
+                                    f"{stage_name} | batch {val_step + 1}/{len(loader_val)}"
+                                ),
+                            )
+
+                if val_task is not None:
+                    train_progress.remove_task(val_task)
                 
                 metrics_per_interval[interval] = {
                     'mae': val_mae,
@@ -1850,9 +2243,9 @@ def main(args):
                 )
                 
                 # 写入tensorboard（分间隔）
-                write_tensorboard(tb_writer, f'Val_Interval{interval}/MAE', val_mae, epoch+1)
-                write_tensorboard(tb_writer, f'Val_Interval{interval}/MSE', val_mse, epoch+1)
-                write_tensorboard(tb_writer, f'Val_Interval{interval}/PSNR', val_psnr, epoch+1)
+                write_experiment_metric(tracker, args.tracking_backend, f'Val_Interval{interval}/MAE', val_mae, epoch+1)
+                write_experiment_metric(tracker, args.tracking_backend, f'Val_Interval{interval}/MSE', val_mse, epoch+1)
+                write_experiment_metric(tracker, args.tracking_backend, f'Val_Interval{interval}/PSNR', val_psnr, epoch+1)
             
             # 计算加权综合指标
             weighted_mae = sum(metrics_per_interval[i]['mae'] * weights_dict[i] for i in intervals_to_validate)
@@ -1870,10 +2263,10 @@ def main(args):
             )
             logger.info(f"{'='*60}\n")
             
-            write_tensorboard(tb_writer, 'Val_Weighted/MAE', weighted_mae, epoch+1)
-            write_tensorboard(tb_writer, 'Val_Weighted/MSE', weighted_mse, epoch+1)
-            write_tensorboard(tb_writer, 'Val_Weighted/PSNR', weighted_psnr, epoch+1)
-            write_tensorboard(tb_writer, 'Val_Weighted/Metric', val_metric, epoch+1)
+            write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/MAE', weighted_mae, epoch+1)
+            write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/MSE', weighted_mse, epoch+1)
+            write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/PSNR', weighted_psnr, epoch+1)
+            write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/Metric', val_metric, epoch+1)
             
             # 保存最优模型（保持原逻辑）
             if val_metric < best_val_metric:
@@ -1907,19 +2300,83 @@ def main(args):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
+        distributed_barrier()
+
         # 终止训练
         if train_steps >= args.max_train_steps:
             break
 
     # 训练结束
+    distributed_barrier()
     if rank == 0:
+        if train_progress is not None:
+            train_progress.stop()
         logger.info(f"Training finished! Total steps: {train_steps}")
+        close_experiment_tracker(tracker, args.tracking_backend)
     cleanup()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/config_cta.yaml")
     # ========== 新增参数：血管mask最大权重 ==========
-    parser.add_argument("--vessel_max_weight", type=float, default=10.0, help="Max weight for vessel region (default: 10)")
-    args = parser.parse_args()
-    main(OmegaConf.load(args.config))
+    parser.add_argument("--vessel_max_weight", type=float, default=None, help="Max weight for vessel region")
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging verbosity",
+    )
+    parser.add_argument(
+        "--tracker",
+        type=str,
+        default=None,
+        choices=["tensorboard", "wandb"],
+        help="Experiment tracking backend",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=None,
+        help="Weights & Biases project name",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Weights & Biases entity/team",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default=None,
+        choices=["online", "offline", "disabled"],
+        help="Weights & Biases logging mode",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Weights & Biases run name",
+    )
+    cli_args = parser.parse_args()
+
+    config = OmegaConf.load(cli_args.config)
+    if cli_args.vessel_max_weight is not None:
+        if not hasattr(config, "vessel_mask") or config.vessel_mask is None:
+            config.vessel_mask = OmegaConf.create({})
+        config.vessel_mask.max_weight = cli_args.vessel_max_weight
+    if cli_args.log_level is not None:
+        config.log_level = cli_args.log_level
+    if cli_args.tracker is not None:
+        config.tracking_backend = cli_args.tracker
+    if cli_args.wandb_project is not None:
+        config.wandb_project = cli_args.wandb_project
+    if cli_args.wandb_entity is not None:
+        config.wandb_entity = cli_args.wandb_entity
+    if cli_args.wandb_mode is not None:
+        config.wandb_mode = cli_args.wandb_mode
+    if cli_args.wandb_run_name is not None:
+        config.wandb_run_name = cli_args.wandb_run_name
+
+    main(config)

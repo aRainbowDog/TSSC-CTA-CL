@@ -3,12 +3,12 @@
 eval_only: false
 
 # 数据路径（根据您的实际路径选择）
-data_path_train: "/home/hychen/project/CTA/data/TSSC_stage1_dataset/train"
-data_path_test: "/home/hychen/project/CTA/data/TSSC_stage1_dataset/test"
-pretrained_vae_model_path: "../ckpts/"
+data_path_train: "data/TSSC_stage1_dataset/train"
+data_path_test: "data/TSSC_stage1_dataset/test"
+pretrained_vae_model_path: "ckpts/"
 
 # save and load
-results_dir: "../Results/runs_CurriculumLearning_v6"  # 新版本
+results_dir: "../results/runs_CurriculumLearning_v260310"  # 新版本
 pretrained: ""
 resume_from_checkpoint: false
 test_ckpt: ""
@@ -23,9 +23,18 @@ tar_num_frames: 3  # 三元组
 image_size: 256
 diffusion_steps: 500
 learn_sigma: True
+triplet_loss_mode: "auto"  # auto | epsilon | x0
 train_batch_size: 1
 val_batch_size: 1
 test_batch_size: 1
+
+# logging
+log_level: "INFO"
+tracking_backend: "wandb"  # tensorboard | wandb
+wandb_project: "TSSC-CTA-CL"
+wandb_entity: "mvi-cta"
+wandb_mode: "online"  # online | offline | disabled
+wandb_run_name: "TSSC-CTA-CL"
 
 # train config:
 save_ceph: True
@@ -33,7 +42,7 @@ learning_rate: 5e-5
 ckpt_every_iter: 5000
 clip_max_norm: 1.0
 start_clip_iter: 500
-max_train_steps: 800000
+max_train_steps: 8000
 timestep_respacing_train: ""
 timestep_respacing_test: "ddim50"
 val_interval: 1
@@ -53,19 +62,19 @@ gradient_checkpointing: True
 # ========== 课程学习（修正后） ==========
 curriculum_learning:
   # ========== 阶段0：新增Gap=1（伪GT） ==========
-  stage0_steps: 500
+  stage0_steps: 500 # 500
   stage0_frame_gap: 1
   stage0_dense_frames: 2  # 只需要2帧
   stage0_use_pseudo_gt: true
   stage0_alpha_range: [0.3, 0.7]  # α随机范围
   
   # ========== 阶段1：修正Gap=2 ==========
-  stage1_steps: 1500
+  stage1_steps: 2000 # 1500
   stage1_frame_gap: 2  # 修正：之前错误地写成1
   stage1_dense_frames: 3
   
   # ========== 阶段2：修正Gap=4 ==========
-  stage2_steps: 2500
+  stage2_steps: 4000 # 2500
   stage2_frame_gap: 4  # 修正：之前写成2
   stage2_dense_frames: 5
   
