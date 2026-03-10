@@ -45,12 +45,13 @@ start_clip_iter: 500
 max_train_steps: 8000
 timestep_respacing_train: ""
 timestep_respacing_test: "ddim50"
-val_interval: 1
+val_interval: 5
 global_seed: 3407
 num_workers: 8
 log_every: 200
 lr_warmup_steps: 0
 gradient_accumulation_steps: 32
+ddp_timeout_minutes: 180
 num_classes: 1
 
 # low VRAM and speed up training

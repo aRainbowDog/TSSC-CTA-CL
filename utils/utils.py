@@ -6,6 +6,7 @@ import random
 import subprocess
 import numpy as np
 import torch.distributed as dist
+from datetime import timedelta
 
 # from torch._six import inf
 from torch import inf
@@ -321,7 +322,7 @@ def cleanup():
         dist.destroy_process_group()
 
 
-def setup_distributed(backend="nccl", port=None):
+def setup_distributed(backend="nccl", port=None, timeout_minutes=180):
     """Initialize distributed training environment.
     support both slurm and torch.distributed.launch
     see torch.distributed.init_process_group() for more details
@@ -377,6 +378,7 @@ def setup_distributed(backend="nccl", port=None):
         backend=backend,
         world_size=world_size,
         rank=rank,
+        timeout=timedelta(minutes=timeout_minutes),
     )
     return rank, local_rank, world_size
 

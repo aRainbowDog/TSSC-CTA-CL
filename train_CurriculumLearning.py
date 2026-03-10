@@ -1206,7 +1206,11 @@ def backward_recursive_triplets(
 def main(args):
     # 1. 基础校验与分布式初始化
     assert torch.cuda.is_available(), "Training requires at least one GPU."
-    rank, local_rank, world_size = setup_distributed(backend="nccl")  # 初始化分布式环境
+    ddp_timeout_minutes = int(getattr(args, "ddp_timeout_minutes", 180))
+    rank, local_rank, world_size = setup_distributed(
+        backend="nccl",
+        timeout_minutes=ddp_timeout_minutes,
+    )  # 初始化分布式环境
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)  # 绑定当前进程到local_rank对应的GPU
 
@@ -1260,6 +1264,7 @@ def main(args):
         OmegaConf.save(args, os.path.join(experiment_dir, 'config_cta.yaml'))
         logger.info(f"Experiment dir: {experiment_dir}")
         logger.info(f"World size: {world_size}, Rank: {rank}, Local rank: {local_rank}")
+        logger.info(f"DDP timeout: {ddp_timeout_minutes} minutes")
         logger.info(f"Tracking backend: {tracking_backend}")
     else:
         logger = create_logger_compat(None, level=log_level)
@@ -2359,6 +2364,12 @@ if __name__ == "__main__":
         default=None,
         help="Weights & Biases run name",
     )
+    parser.add_argument(
+        "--ddp-timeout-minutes",
+        type=int,
+        default=None,
+        help="Process group timeout in minutes for long rank-0 validation/checkpoint sections",
+    )
     cli_args = parser.parse_args()
 
     config = OmegaConf.load(cli_args.config)
@@ -2378,5 +2389,7 @@ if __name__ == "__main__":
         config.wandb_mode = cli_args.wandb_mode
     if cli_args.wandb_run_name is not None:
         config.wandb_run_name = cli_args.wandb_run_name
+    if cli_args.ddp_timeout_minutes is not None:
+        config.ddp_timeout_minutes = cli_args.ddp_timeout_minutes
 
     main(config)
