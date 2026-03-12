@@ -1,0 +1,40 @@
+# --- 深度学习核心框架 ---
+torch==2.2.0
+torchvision==0.17.0
+torchaudio==2.2.0
+
+# --- 医疗影像与计算机视觉 ---
+monai==1.2.0
+nibabel==5.3.3
+simpleitk==2.5.3
+opencv-python==4.8.1.78
+scikit-image==0.26.0
+pillow==12.0.0
+
+# --- 生成模型与网络架构 ---
+diffusers==0.25.0
+huggingface_hub==0.25.2
+accelerate==0.21.0
+timm==1.0.24
+bitsandbytes==0.42.0
+
+# --- 视频与多帧序列处理 ---
+av==16.1.0
+decord==0.6.0
+imageio-ffmpeg==0.6.0
+ImageIO==2.37.2
+
+# --- 张量操作与科学计算 ---
+einops==0.8.1
+numpy==1.26.4
+scipy==1.17.0
+scikit-learn==1.8.0
+
+# --- 实验记录、配置与可视化 ---
+tensorboard==2.20.0
+wandb==0.23.1
+matplotlib==3.10.8
+omegaconf==2.3.0
+tqdm==4.67.1
+fire
+rich
