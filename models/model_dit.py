@@ -272,6 +272,7 @@ class MVIF(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.gradient_checkpointing = False
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -293,6 +294,12 @@ class MVIF(nn.Module):
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, self.num_frames)
         self.initialize_weights()
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -376,13 +383,10 @@ class MVIF(nn.Module):
         c = t + y                             # (N, D)
 
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
-        # for block in self.blocks:
-        #     if self.training:  # 只在训练时开启，推理时不开启以保持速度
-        #         # 使用 gradient checkpointing
-        #         x = checkpoint(block, x, c, use_reentrant=False)
-        #     else:
-        #         x = block(x, c)
+            if self.training and self.gradient_checkpointing:
+                x = checkpoint(block, x, c, use_reentrant=False)
+            else:
+                x = block(x, c)                      # (N, T, D)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
 
         x = self.unpatchify(x)                   # (N, out_channels, H, W)

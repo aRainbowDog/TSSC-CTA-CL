@@ -5,6 +5,7 @@ import decord
 import torchvision
 import torchvision.transforms as transforms
 import torch.nn.functional as F
+import torch.distributed as dist
 import numpy as np
 import re
 import random
@@ -21,15 +22,23 @@ except ImportError:
 class_labels_map = None
 cls_sample_cnt = None
 
+
+def is_main_process():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return int(os.environ.get("RANK", "0")) == 0
+
 def get_filelist(file_path):
     """递归获取文件列表，过滤非视频文件"""
     Filelist = []
     video_ext = ('.mp4', '.avi', '.mov', '.mkv')
     for home, dirs, files in os.walk(file_path):
+        dirs.sort()
+        files.sort()
         for filename in files:
             if filename.lower().endswith(video_ext):
                 Filelist.append(os.path.join(home, filename))
-    return Filelist
+    return sorted(Filelist)
 
 class DecordInit(object):
     """Using Decord to initialize the video_reader"""
@@ -93,7 +102,8 @@ class data_loader(torch.utils.data.Dataset):
             
             self.stage3_gap, self.stage3_frames = 8, 9
 
-        print(f"[{self.stage}] 四阶段模式 | Gap: {self.stage0_gap}/{self.stage1_gap}/{self.stage2_gap}/{self.stage3_gap}")
+        if is_main_process():
+            print(f"[{self.stage}] 四阶段模式 | Gap: {self.stage0_gap}/{self.stage1_gap}/{self.stage2_gap}/{self.stage3_gap}")
         
         self.v_decoder = DecordInit()
         
@@ -122,7 +132,8 @@ class data_loader(torch.utils.data.Dataset):
         else:
             raise ValueError(f"stage 必须是 train/val/test，当前为 {self.stage}")
         
-        print(f"[{self.stage}] 加载视频数量: {len(self.video_lists)}")
+        if is_main_process():
+            print(f"[{self.stage}] 加载视频数量: {len(self.video_lists)}")
 
     def set_training_step(self, step):
         """从训练循环中设置当前步数"""

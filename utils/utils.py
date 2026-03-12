@@ -6,6 +6,9 @@ import random
 import subprocess
 import numpy as np
 import torch.distributed as dist
+from datetime import timedelta
+from rich.console import Console
+from rich.logging import RichHandler
 
 # from torch._six import inf
 from torch import inf
@@ -13,6 +16,11 @@ from PIL import Image
 from typing import Union, Iterable
 from collections import OrderedDict
 from torch.utils.tensorboard import SummaryWriter
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from diffusers.utils import is_bs4_available, is_ftfy_available
 
@@ -151,44 +159,171 @@ def get_experiment_dir(root_dir, args):
 #                             Training Logger                                   #
 #################################################################################
 
-def create_logger(logging_dir):
+def create_logger(logging_dir, level="INFO", console=None, use_rich=True):
     """
     Create a logger that writes to a log file and stdout.
     """
+    level_name = str(level).upper()
+    level_value = getattr(logging, level_name, None)
+    if not isinstance(level_value, int):
+        raise ValueError(f"Unsupported log level: {level}")
+
     if dist.get_rank() == 0:  # real logger
+        handlers = []
+        if use_rich:
+            handlers.append(
+                RichHandler(
+                    console=console or Console(stderr=True),
+                    show_time=True,
+                    show_level=False,
+                    show_path=False,
+                    rich_tracebacks=True,
+                    markup=False,
+                )
+            )
+        else:
+            handlers.append(logging.StreamHandler())
+        if logging_dir is not None:
+            handlers.append(logging.FileHandler(f"{logging_dir}/log.txt"))
         logging.basicConfig(
-            level=logging.INFO,
-            # format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            format='[%(asctime)s] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+            level=level_value,
+            format="%(message)s" if use_rich else "[%(asctime)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            handlers=handlers,
+            force=True,
         )
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, RichHandler):
+                handler.setLevel(level_value)
+            elif isinstance(handler, logging.FileHandler):
+                handler.setLevel(level_value)
+                handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
         logger = logging.getLogger(__name__)
+        logger.setLevel(level_value)
 
     else:  # dummy logger (does nothing)
         logger = logging.getLogger(__name__)
+        logger.setLevel(level_value)
         logger.addHandler(logging.NullHandler())
     return logger
 
 
-def create_tensorboard(tensorboard_dir):
-    """
-    Create a tensorboard that saves losses.
-    """
-    if dist.get_rank() == 0:  # real tensorboard
-        # tensorboard
-        writer = SummaryWriter(tensorboard_dir)
+def create_experiment_tracker(
+        backend,
+        logging_dir,
+        run_name=None,
+        config=None,
+        project=None,
+        entity=None,
+        mode="online"):
+    """Create a rank-0 experiment tracker."""
+    if dist.get_rank() != 0:
+        return None
 
-    return writer
+    backend = str(backend).lower()
+    if backend == "tensorboard":
+        return SummaryWriter(logging_dir)
+
+    if backend == "wandb":
+        if wandb is None:
+            raise ImportError("wandb is not installed. Please install wandb to use this tracking backend.")
+        os.makedirs(logging_dir, exist_ok=True)
+        return wandb.init(
+            project=project or "TSSC-CTA-CL",
+            entity=entity,
+            mode=mode,
+            dir=logging_dir,
+            name=run_name,
+            config=config,
+            reinit="return_previous",
+        )
+
+    raise ValueError(f"Unsupported tracking backend: {backend}")
+
+
+def write_experiment_metric(tracker, backend, name, value, step):
+    """Write a scalar metric to the configured tracker."""
+    if dist.get_rank() != 0 or tracker is None:
+        return
+
+    backend = str(backend).lower()
+    if backend == "tensorboard":
+        tracker.add_scalar(name, value, step)
+        return
+
+    if backend == "wandb":
+        tracker.log({name: value}, step=step)
+        return
+
+    raise ValueError(f"Unsupported tracking backend: {backend}")
+
+
+def write_experiment_images(tracker, backend, images, step):
+    """Write image examples to the configured tracker."""
+    if dist.get_rank() != 0 or tracker is None or not images:
+        return
+
+    backend = str(backend).lower()
+    if backend == "tensorboard":
+        return
+
+    if backend == "wandb":
+        payload = {}
+        for name, image_spec in images.items():
+            if image_spec is None:
+                continue
+            if isinstance(image_spec, list):
+                image_list = []
+                for one_spec in image_spec:
+                    if one_spec is None:
+                        continue
+                    image_path = one_spec.get("path")
+                    if image_path is None or not os.path.exists(image_path):
+                        continue
+                    caption = one_spec.get("caption")
+                    image_list.append(wandb.Image(image_path, caption=caption))
+                if image_list:
+                    payload[name] = image_list
+                continue
+
+            image_path = image_spec.get("path")
+            if image_path is None or not os.path.exists(image_path):
+                continue
+            caption = image_spec.get("caption")
+            payload[name] = wandb.Image(image_path, caption=caption)
+        if payload:
+            tracker.log(payload, step=step)
+        return
+
+    raise ValueError(f"Unsupported tracking backend: {backend}")
+
+
+def close_experiment_tracker(tracker, backend):
+    """Flush/close the configured tracker."""
+    if dist.get_rank() != 0 or tracker is None:
+        return
+
+    backend = str(backend).lower()
+    if backend == "tensorboard":
+        tracker.flush()
+        tracker.close()
+        return
+
+    if backend == "wandb":
+        tracker.finish()
+        return
+
+    raise ValueError(f"Unsupported tracking backend: {backend}")
+
+
+def create_tensorboard(tensorboard_dir):
+    """Backward-compatible TensorBoard creator."""
+    return create_experiment_tracker("tensorboard", tensorboard_dir)
 
 
 def write_tensorboard(writer, *args):
-    '''
-    write the loss information to a tensorboard file.
-    Only for pytorch DDP mode.
-    '''
-    if dist.get_rank() == 0:  # real tensorboard
-        writer.add_scalar(args[0], args[1], args[2])
+    """Backward-compatible TensorBoard scalar writer."""
+    write_experiment_metric(writer, "tensorboard", args[0], args[1], args[2])
 
 
 #################################################################################
@@ -220,19 +355,27 @@ def cleanup():
     """
     End DDP training.
     """
-    dist.destroy_process_group()
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
-def setup_distributed(backend="nccl", port=None):
+def setup_distributed(backend="nccl", port=None, timeout_minutes=180):
     """Initialize distributed training environment.
     support both slurm and torch.distributed.launch
     see torch.distributed.init_process_group() for more details
     """
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        return rank, local_rank, world_size
+
     num_gpus = torch.cuda.device_count()
 
     if "SLURM_JOB_ID" in os.environ:
         rank = int(os.environ["SLURM_PROCID"])
         world_size = int(os.environ["SLURM_NTASKS"])
+        local_rank = rank % max(1, num_gpus)
         node_list = os.environ["SLURM_NODELIST"]
         addr = subprocess.getoutput(f"scontrol show hostname {node_list} | head -n1")
         # specify master port
@@ -244,19 +387,37 @@ def setup_distributed(backend="nccl", port=None):
         if "MASTER_ADDR" not in os.environ:
             os.environ["MASTER_ADDR"] = addr
         os.environ["WORLD_SIZE"] = str(world_size)
-        os.environ["LOCAL_RANK"] = str(rank % num_gpus)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        os.environ["RANK"] = str(rank)
+    elif "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", str(port or 29500))
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = "0"
         os.environ["RANK"] = str(rank)
     else:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank % max(1, num_gpus)))
 
-    # torch.cuda.set_device(rank % num_gpus)
+    if num_gpus < 1:
+        raise RuntimeError("Distributed training requires at least one CUDA device.")
+    if "LOCAL_RANK" not in os.environ:
+        local_rank = rank % num_gpus
+        os.environ["LOCAL_RANK"] = str(local_rank)
+
+    torch.cuda.set_device(local_rank)
 
     dist.init_process_group(
         backend=backend,
         world_size=world_size,
         rank=rank,
+        timeout=timedelta(minutes=timeout_minutes),
     )
+    return rank, local_rank, world_size
 
 
 #################################################################################
@@ -1373,4 +1534,3 @@ def calculate_metrics(generated_video, gt_video):
     avg_ssim = total_ssim / num_frames
 
     return avg_mse, avg_mae, avg_psnr, avg_ssim
-
