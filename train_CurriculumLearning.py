@@ -109,6 +109,18 @@ def get_fixed_visualization_indices(dataset_len, count):
     return sorted({int(idx) for idx in np.linspace(0, dataset_len - 1, num=count)})
 
 
+def get_visualization_stage_info(current_step, stage1_steps, stage2_steps):
+    """Return visualization stage id/name for the current training step."""
+    stage0_steps = 500
+    if current_step < stage0_steps:
+        return 0, "Stage0_Gap1"
+    if current_step < stage1_steps:
+        return 1, "Stage1_Gap2"
+    if current_step < stage2_steps:
+        return 2, "Stage2_Gap4"
+    return 3, "Stage3_Gap8"
+
+
 class DistributedEvalSampler(Sampler):
     """Shard validation samples across ranks without padding or duplication."""
 
@@ -506,24 +518,15 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
     """
     b_val, f_val, c_val, h_val, w_val = video_val.shape
 
-    stage0_steps = 500
-    
+    stage, stage_name = get_visualization_stage_info(current_step, stage1_steps, stage2_steps)
+
     # 确定当前阶段
-    if current_step < stage0_steps:
+    if stage == 0:
         if logger is not None:
             logger.warning(f"Epoch {epoch+1}: Stage0，跳过可视化")
         else:
             print(f"⚠️  Epoch {epoch+1}: Stage0，跳过可视化")
         return {}
-    elif current_step < stage1_steps:
-        stage = 1
-        stage_name = "Stage1_Gap1"
-    elif current_step < stage2_steps:
-        stage = 2
-        stage_name = "Stage2_Gap2"
-    else:
-        stage = 3
-        stage_name = "Stage3_Gap4"
     
     # VAE编码全部密集帧
     with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
@@ -654,12 +657,6 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
                 "caption": f"Epoch {epoch+1} {stage_name} base triplet idx {sample_id}",
             })
 
-        if logger is not None:
-            logger.info(
-                f"Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}，样本数={len(sample_ids)}）"
-            )
-        else:
-            print(f"✅ Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}，样本数={len(sample_ids)}）")
         del z, samples_base, decoded_base
 
     generated_images = {
@@ -1020,12 +1017,6 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
                     "caption": f"Epoch {epoch+1} {stage_name} recursive {num_frames_rec} frames idx {sample_id}",
                 })
             
-            if logger is not None:
-                logger.info(
-                    f"Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部，样本数={len(sample_ids)}）"
-                )
-            else:
-                print(f"✅ Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部，样本数={len(sample_ids)}）")
             generated_images["Val Examples/Recursive"] = recursive_images
     
     torch.cuda.empty_cache()
@@ -2067,10 +2058,12 @@ def main(args):
             with torch.no_grad():
                 dataset_val.set_training_step(train_steps)
                 val_example_images = {}
+                vis_chunk_count = 0
                 for vis_start in range(0, len(val_visualization_indices), val_visualization_batch_size):
                     chunk_indices = val_visualization_indices[vis_start: vis_start + val_visualization_batch_size]
                     if not chunk_indices:
                         continue
+                    vis_chunk_count += 1
                     video_val = torch.stack(
                         [dataset_val[idx]['video'] for idx in chunk_indices],
                         dim=0,
@@ -2100,6 +2093,18 @@ def main(args):
                             existing_images.append(image_spec)
                     del video_val, chunk_images
                     torch.cuda.empty_cache()
+
+                vis_stage, vis_stage_name = get_visualization_stage_info(
+                    train_steps,
+                    args.stage1_steps,
+                    args.stage2_steps,
+                )
+                if vis_stage > 0 and logger is not None and len(val_visualization_indices) > 0:
+                    vis_modes = "基础预测+递归链" if vis_stage >= 2 else "基础预测"
+                    logger.info(
+                        f"Epoch {epoch+1} {vis_stage_name} 可视化保存完成"
+                        f"（{vis_modes}，样本数={len(val_visualization_indices)}，批次数={vis_chunk_count}）"
+                    )
                 write_experiment_images(
                     tracker,
                     args.tracking_backend,
