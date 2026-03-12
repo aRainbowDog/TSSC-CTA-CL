@@ -7,6 +7,8 @@ import subprocess
 import numpy as np
 import torch.distributed as dist
 from datetime import timedelta
+from rich.console import Console
+from rich.logging import RichHandler
 
 # from torch._six import inf
 from torch import inf
@@ -157,7 +159,7 @@ def get_experiment_dir(root_dir, args):
 #                             Training Logger                                   #
 #################################################################################
 
-def create_logger(logging_dir, level="INFO"):
+def create_logger(logging_dir, level="INFO", console=None, use_rich=True):
     """
     Create a logger that writes to a log file and stdout.
     """
@@ -167,14 +169,35 @@ def create_logger(logging_dir, level="INFO"):
         raise ValueError(f"Unsupported log level: {level}")
 
     if dist.get_rank() == 0:  # real logger
+        handlers = []
+        if use_rich:
+            handlers.append(
+                RichHandler(
+                    console=console or Console(stderr=True),
+                    show_time=True,
+                    show_level=False,
+                    show_path=False,
+                    rich_tracebacks=True,
+                    markup=False,
+                )
+            )
+        else:
+            handlers.append(logging.StreamHandler())
+        if logging_dir is not None:
+            handlers.append(logging.FileHandler(f"{logging_dir}/log.txt"))
         logging.basicConfig(
             level=level_value,
-            # format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            format='[%(asctime)s] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")],
+            format="%(message)s" if use_rich else "[%(asctime)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            handlers=handlers,
             force=True,
         )
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, RichHandler):
+                handler.setLevel(level_value)
+            elif isinstance(handler, logging.FileHandler):
+                handler.setLevel(level_value)
+                handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
         logger = logging.getLogger(__name__)
         logger.setLevel(level_value)
 
@@ -249,6 +272,20 @@ def write_experiment_images(tracker, backend, images, step):
         for name, image_spec in images.items():
             if image_spec is None:
                 continue
+            if isinstance(image_spec, list):
+                image_list = []
+                for one_spec in image_spec:
+                    if one_spec is None:
+                        continue
+                    image_path = one_spec.get("path")
+                    if image_path is None or not os.path.exists(image_path):
+                        continue
+                    caption = one_spec.get("caption")
+                    image_list.append(wandb.Image(image_path, caption=caption))
+                if image_list:
+                    payload[name] = image_list
+                continue
+
             image_path = image_spec.get("path")
             if image_path is None or not os.path.exists(image_path):
                 continue

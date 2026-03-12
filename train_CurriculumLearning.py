@@ -1,5 +1,6 @@
 # autodl
 import os
+import gc
 # 临时开启expandable_segments（加载阶段用，训练时再关闭）
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import math
@@ -30,7 +31,7 @@ from models.model_dit import MVIF_models
 from models.diffusion.gaussian_diffusion import create_diffusion, ModelMeanType
 from dataloader.data_loader_acdc import data_loader
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from diffusers.models import AutoencoderKL
 from diffusers.optimization import get_scheduler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -57,10 +58,10 @@ def log_debug(logger, *lines):
         logger.debug(line)
 
 
-def create_logger_compat(logging_dir, level="INFO"):
+def create_logger_compat(logging_dir, level="INFO", console=None):
     """Support both old and new create_logger signatures."""
     try:
-        return create_logger(logging_dir, level=level)
+        return create_logger(logging_dir, level=level, console=console)
     except TypeError:
         logger = create_logger(logging_dir)
         resolved_level = getattr(logging, str(level).upper(), logging.INFO)
@@ -90,6 +91,44 @@ def create_rich_progress(console=None):
         expand=True,
         refresh_per_second=4,
     )
+
+
+def maybe_cleanup_cuda(step, interval):
+    if interval is None or interval <= 0 or step <= 0 or step % interval != 0:
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+
+
+def get_fixed_visualization_indices(dataset_len, count):
+    if dataset_len <= 0 or count <= 0:
+        return []
+    if count >= dataset_len:
+        return list(range(dataset_len))
+    return sorted({int(idx) for idx in np.linspace(0, dataset_len - 1, num=count)})
+
+
+class DistributedEvalSampler(Sampler):
+    """Shard validation samples across ranks without padding or duplication."""
+
+    def __init__(self, dataset, num_replicas=None, rank=None):
+        if num_replicas is None:
+            num_replicas = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        if rank is None:
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self):
+        remaining = len(self.dataset) - self.rank
+        if remaining <= 0:
+            return 0
+        return (remaining + self.num_replicas - 1) // self.num_replicas
 
 
 def get_stage_metadata(train_steps, args):
@@ -453,10 +492,10 @@ def get_ema_decay(train_steps, base_decay=0.9999, min_decay=0.99, warmup_steps=1
         decay = base_decay
     return decay
 
-def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, val_fold, 
-                                          generate_vessel_mask_adaptive, raw_model, 
-                                          current_step, stage1_steps, stage2_steps,
-                                          ema_model=None, logger=None):
+def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, val_fold,
+                                  generate_vessel_mask_adaptive, raw_model,
+                                  current_step, stage1_steps, stage2_steps,
+                                  sample_ids=None, ema_model=None, logger=None):
     """
     (epoch, video_val, vae, val_diffusion, device, val_fold, generate_vessel_mask_adaptive, raw_model, ema_model=None)
     三元组验证可视化（4行完整版）
@@ -493,18 +532,21 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
         latent_val = rearrange(latent_val, '(b f) c h w -> b f c h w', b=b_val)
     
     b_val, f_val, c_latent, h_latent_val, w_latent_val = latent_val.shape
-    sample_idx = 0
+    sample_ids = list(sample_ids) if sample_ids is not None else list(range(b_val))
     
     # 生成血管mask可视化
     video_val_np = video_val.detach().cpu().numpy()
     video_val_gray = np.mean(video_val_np, axis=2)
-    frames_gray = [video_val_gray[sample_idx, t] for t in range(f_val)]
-    mask_final, soft_weight = generate_vessel_mask_adaptive(frames_gray)
-    
-    vessel_mask_vis = torch.from_numpy(mask_final).float().to(device)
-    vessel_mask_vis = vessel_mask_vis.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-    vessel_mask_vis = vessel_mask_vis.repeat(1, f_val, 3, 1, 1)
-    vessel_mask_vis = (vessel_mask_vis / 255.0) * 2 - 1
+    vessel_mask_batches = []
+    for batch_idx in range(b_val):
+        frames_gray = [video_val_gray[batch_idx, t] for t in range(f_val)]
+        mask_final, _ = generate_vessel_mask_adaptive(frames_gray)
+        vessel_mask_vis = torch.from_numpy(mask_final).float().to(device)
+        vessel_mask_vis = vessel_mask_vis.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        vessel_mask_vis = vessel_mask_vis.repeat(1, f_val, 3, 1, 1)
+        vessel_mask_vis = (vessel_mask_vis / 255.0) * 2 - 1
+        vessel_mask_batches.append(vessel_mask_vis)
+    vessel_mask_vis = torch.cat(vessel_mask_batches, dim=0)
     
     # ========== 1. 基础预测（三元组，一步到位） ==========
     with torch.no_grad():
@@ -581,41 +623,47 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
         mask_base_vis[:, 0, :, :, :] = 0  # 第0帧（首帧）不遮罩
         mask_base_vis[:, 2, :, :, :] = 0  # 第2帧（尾帧）不遮罩
         
-        # 提取单个样本
-        video_val_single = triplet_video_gt[sample_idx:sample_idx+1]
-        decoded_base_single = decoded_base[sample_idx:sample_idx+1]
-        mask_base_vis_single = mask_base_vis[sample_idx:sample_idx+1]
-        vessel_mask_single = triplet_vessel_mask[sample_idx:sample_idx+1]
-        
-        # 拼接4行
-        val_pic_base = torch.cat([
-            video_val_single,                              # 第1行：GT三元组
-            video_val_single * (1 - mask_base_vis_single), # 第2行：Masked输入（灰色遮罩）
-            decoded_base_single,                           # 第3行：预测三元组
-            vessel_mask_single                             # 第4行：血管mask
-        ], dim=1)
-        
-        val_pic_base_flat = rearrange(val_pic_base, 'b f c h w -> (b f) c h w')
-        base_image_path = os.path.join(val_fold, f"Epoch_{epoch+1}_{stage_name}_base_triplet.png")
-        save_image(
-            val_pic_base_flat,
-            base_image_path,
-            nrow=3,  # 3列（三元组）
-            normalize=True,
-            value_range=(-1, 1)
-        )
-        
+        base_images = []
+        for sample_idx, sample_id in enumerate(sample_ids):
+            video_val_single = triplet_video_gt[sample_idx:sample_idx+1]
+            decoded_base_single = decoded_base[sample_idx:sample_idx+1]
+            mask_base_vis_single = mask_base_vis[sample_idx:sample_idx+1]
+            vessel_mask_single = triplet_vessel_mask[sample_idx:sample_idx+1]
+
+            val_pic_base = torch.cat([
+                video_val_single,
+                video_val_single * (1 - mask_base_vis_single),
+                decoded_base_single,
+                vessel_mask_single
+            ], dim=1)
+
+            val_pic_base_flat = rearrange(val_pic_base, 'b f c h w -> (b f) c h w')
+            base_image_path = os.path.join(
+                val_fold,
+                f"Epoch_{epoch+1}_{stage_name}_base_triplet_idx_{sample_id:04d}.png",
+            )
+            save_image(
+                val_pic_base_flat,
+                base_image_path,
+                nrow=3,
+                normalize=True,
+                value_range=(-1, 1)
+            )
+            base_images.append({
+                "path": base_image_path,
+                "caption": f"Epoch {epoch+1} {stage_name} base triplet idx {sample_id}",
+            })
+
         if logger is not None:
-            logger.info(f"Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}）")
+            logger.info(
+                f"Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}，样本数={len(sample_ids)}）"
+            )
         else:
-            print(f"✅ Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}）")
+            print(f"✅ Epoch {epoch+1} {stage_name} 基础预测（三元组：帧{frame_indices_original}，样本数={len(sample_ids)}）")
         del z, samples_base, decoded_base
 
     generated_images = {
-        "Val Examples/BaseTriplet": {
-            "path": base_image_path,
-            "caption": f"Epoch {epoch+1} {stage_name} base triplet",
-        }
+        "Val Examples/BaseTriplet": base_images
     }
     
     # ========== 2. 递归链预测（逐层细化，完整帧序列） ==========
@@ -941,38 +989,44 @@ def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, 
             mask_rec_vis[:, 0, :, :, :] = 0   # 首帧不遮罩
             mask_rec_vis[:, -1, :, :, :] = 0  # 尾帧不遮罩
             
-            # 提取单个样本
-            result_single = result_video[sample_idx:sample_idx+1]
-            video_val_rec_single = video_val_rec[sample_idx:sample_idx+1]
-            mask_rec_vis_single = mask_rec_vis[sample_idx:sample_idx+1]
-            vessel_mask_rec_single = vessel_mask_rec[sample_idx:sample_idx+1]
-            
-            # 拼接4行
-            val_pic_rec = torch.cat([
-                video_val_rec_single,                              # 第1行：GT完整帧
-                video_val_rec_single * (1 - mask_rec_vis_single),  # 第2行：Masked输入（只有首尾）
-                result_single,                                     # 第3行：递归链预测
-                vessel_mask_rec_single                             # 第4行：血管mask
-            ], dim=1)
-            
-            val_pic_rec_flat = rearrange(val_pic_rec, 'b f c h w -> (b f) c h w')
-            recursive_image_path = os.path.join(val_fold, f"Epoch_{epoch+1}_{stage_name}_recursive_full.png")
-            save_image(
-                val_pic_rec_flat,
-                recursive_image_path,
-                nrow=num_frames_rec,  # 5帧或9帧
-                normalize=True,
-                value_range=(-1, 1)
-            )
+            recursive_images = []
+            for sample_idx, sample_id in enumerate(sample_ids):
+                result_single = result_video[sample_idx:sample_idx+1]
+                video_val_rec_single = video_val_rec[sample_idx:sample_idx+1]
+                mask_rec_vis_single = mask_rec_vis[sample_idx:sample_idx+1]
+                vessel_mask_rec_single = vessel_mask_rec[sample_idx:sample_idx+1]
+                
+                val_pic_rec = torch.cat([
+                    video_val_rec_single,
+                    video_val_rec_single * (1 - mask_rec_vis_single),
+                    result_single,
+                    vessel_mask_rec_single
+                ], dim=1)
+                
+                val_pic_rec_flat = rearrange(val_pic_rec, 'b f c h w -> (b f) c h w')
+                recursive_image_path = os.path.join(
+                    val_fold,
+                    f"Epoch_{epoch+1}_{stage_name}_recursive_full_idx_{sample_id:04d}.png",
+                )
+                save_image(
+                    val_pic_rec_flat,
+                    recursive_image_path,
+                    nrow=num_frames_rec,
+                    normalize=True,
+                    value_range=(-1, 1)
+                )
+                recursive_images.append({
+                    "path": recursive_image_path,
+                    "caption": f"Epoch {epoch+1} {stage_name} recursive {num_frames_rec} frames idx {sample_id}",
+                })
             
             if logger is not None:
-                logger.info(f"Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部）")
+                logger.info(
+                    f"Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部，样本数={len(sample_ids)}）"
+                )
             else:
-                print(f"✅ Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部）")
-            generated_images["Val Examples/Recursive"] = {
-                "path": recursive_image_path,
-                "caption": f"Epoch {epoch+1} {stage_name} recursive {num_frames_rec} frames",
-            }
+                print(f"✅ Epoch {epoch+1} {stage_name} 递归链预测（{num_frames_rec}帧，首尾→全部，样本数={len(sample_ids)}）")
+            generated_images["Val Examples/Recursive"] = recursive_images
     
     torch.cuda.empty_cache()
     return generated_images
@@ -1213,6 +1267,7 @@ def main(args):
     )  # 初始化分布式环境
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)  # 绑定当前进程到local_rank对应的GPU
+    cuda_empty_cache_interval = int(getattr(args, "cuda_empty_cache_interval", 100))
 
     # 2. 显存优化配置（加载阶段开启expandable_segments，训练时关闭）
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1246,12 +1301,15 @@ def main(args):
     wandb_entity = getattr(args, "wandb_entity", None)
     wandb_mode = str(getattr(args, "wandb_mode", "online")).lower()
     wandb_run_name = getattr(args, "wandb_run_name", None) or os.path.basename(experiment_dir)
+    val_visualization_count = int(getattr(args, "val_visualization_count", 20))
+    val_visualization_batch_size = int(getattr(args, "val_visualization_batch_size", 4))
+    shared_console = Console(stderr=True) if rank == 0 else None
     
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(val_fold, exist_ok=True)
-        logger = create_logger_compat(experiment_dir, level=log_level)
+        logger = create_logger_compat(experiment_dir, level=log_level, console=shared_console)
         tracker = create_experiment_tracker(
             backend=tracking_backend,
             logging_dir=os.path.join(experiment_dir, "runs") if tracking_backend == "tensorboard" else experiment_dir,
@@ -1265,9 +1323,10 @@ def main(args):
         logger.info(f"Experiment dir: {experiment_dir}")
         logger.info(f"World size: {world_size}, Rank: {rank}, Local rank: {local_rank}")
         logger.info(f"DDP timeout: {ddp_timeout_minutes} minutes")
+        logger.info(f"CUDA cache cleanup interval: {cuda_empty_cache_interval} optimizer steps")
         logger.info(f"Tracking backend: {tracking_backend}")
     else:
-        logger = create_logger_compat(None, level=log_level)
+        logger = create_logger_compat(None, level=log_level, console=shared_console)
         tracker = None
 
     # ========== 读取课程学习配置 ==========
@@ -1486,9 +1545,24 @@ def main(args):
 
     # 验证集
     dataset_val = data_loader(args, stage='val')
-    loader_val = None
+    val_visualization_indices = get_fixed_visualization_indices(len(dataset_val), val_visualization_count)
+    sampler_val_metrics = DistributedEvalSampler(
+        dataset_val,
+        num_replicas=world_size,
+        rank=rank,
+    )
+    loader_val_metrics = DataLoader(
+        dataset_val,
+        batch_size=args.val_batch_size,
+        shuffle=False,
+        sampler=sampler_val_metrics,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=False,
+    )
+    loader_val_vis = None
     if rank == 0:
-        loader_val = DataLoader(
+        loader_val_vis = DataLoader(
             dataset_val,
             batch_size=args.val_batch_size,
             shuffle=False,
@@ -1504,6 +1578,11 @@ def main(args):
         logger.info(f"Val dataset size: {len(dataset_val)}")
         logger.info(f"Train batches per epoch: {train_batches_per_epoch}")
         logger.info(f"Train optimizer steps per epoch: {train_updates_per_epoch}")
+        logger.info(f"Val batches per rank: {len(loader_val_metrics)}")
+        logger.info(
+            f"Val visualization samples: {len(val_visualization_indices)} "
+            f"(batch size {val_visualization_batch_size})"
+        )
 
     # ========== 断点续训核心优化（终极版） ==========
     # 强制清理所有冗余显存
@@ -1612,7 +1691,7 @@ def main(args):
     epoch_task = None
     if rank == 0:
         initial_epoch_completed = resume_step if args.resume_from_checkpoint and first_epoch < num_train_epochs else 0
-        train_progress = create_rich_progress()
+        train_progress = create_rich_progress(shared_console)
         train_progress.start()
         overall_task = train_progress.add_task(
             "Overall Opt Step",
@@ -1676,6 +1755,10 @@ def main(args):
             stage = batch['stage'][0].item()  # ✅ 从batch获取stage
             frame_gap = batch['frame_gap'][0].item()  # ✅ 从batch获取frame_gap
             b, f, c, h, w = video.shape
+            video_flat = None
+            latent_sparse = None
+            loss = None
+            base_loss = None
 
             # VAE编码
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.mixed_precision):
@@ -1765,7 +1848,7 @@ def main(args):
                     total_loss_value = base_loss_value + args.recursive_weight * recursive_loss_value
                     loss_display_value = total_loss_value
                     loss = torch.tensor(total_loss_value / accum_divisor, device=device)
-                    del recursive_triplets, base_loss
+                    del recursive_triplets
                 
                 else:  # stage == 3
                     latent_sparse = torch.stack([latent[:, 0], latent[:, 4], latent[:, 8]], dim=1)
@@ -1798,7 +1881,7 @@ def main(args):
                     total_loss_value = base_loss_value + args.recursive_weight * recursive_loss_value
                     loss_display_value = total_loss_value
                     loss = torch.tensor(total_loss_value / accum_divisor, device=device)
-                    del recursive_triplets, base_loss
+                    del recursive_triplets
 
             # 梯度裁剪（累计到指定步数）
             if should_step:
@@ -1892,6 +1975,8 @@ def main(args):
                     log_steps = 0
                     start_time = time()
 
+                maybe_cleanup_cuda(train_steps, cuda_empty_cache_interval)
+
             if rank == 0 and train_progress is not None:
                 train_progress.update(
                     epoch_task,
@@ -1914,6 +1999,18 @@ def main(args):
                     completed=train_steps,
                     status=format_overall_progress_status(epoch, num_train_epochs, train_steps, args),
                 )
+
+            del batch, video, latent, t
+            if video_flat is not None:
+                del video_flat
+            if latent_sparse is not None:
+                del latent_sparse
+            if weight_batch is not None:
+                del weight_batch
+            if loss is not None:
+                del loss
+            if base_loss is not None:
+                del base_loss
 
             # 终止条件
             if train_steps >= args.max_train_steps:
@@ -1969,25 +2066,40 @@ def main(args):
             
             with torch.no_grad():
                 dataset_val.set_training_step(train_steps)
-                # 只取验证集第一个batch
-                val_batch = next(iter(loader_val))
-                video_val = val_batch['video'].to(device)
-                
-                # 调用可视化函数（同时传raw model和EMA model）
-                val_example_images = save_val_sample_visualization(
-                    epoch=epoch,
-                    video_val=video_val,
-                    vae=vae,
-                    val_diffusion=val_diffusion,
-                    device=device,
-                    val_fold=val_fold,
-                    generate_vessel_mask_adaptive=generate_vessel_mask_adaptive,
-                    raw_model=get_raw_model(model),  # 原始模型（解包DDP）
-                    current_step=train_steps,
-                    stage1_steps=args.stage1_steps,
-                    stage2_steps=args.stage2_steps,  # EMA模型（可选，传了就生成EMA的图）
-                    logger=logger,
-                )
+                val_example_images = {}
+                for vis_start in range(0, len(val_visualization_indices), val_visualization_batch_size):
+                    chunk_indices = val_visualization_indices[vis_start: vis_start + val_visualization_batch_size]
+                    if not chunk_indices:
+                        continue
+                    video_val = torch.stack(
+                        [dataset_val[idx]['video'] for idx in chunk_indices],
+                        dim=0,
+                    ).to(device)
+                    chunk_images = save_val_sample_visualization(
+                        epoch=epoch,
+                        video_val=video_val,
+                        vae=vae,
+                        val_diffusion=val_diffusion,
+                        device=device,
+                        val_fold=val_fold,
+                        generate_vessel_mask_adaptive=generate_vessel_mask_adaptive,
+                        raw_model=get_raw_model(model),
+                        current_step=train_steps,
+                        stage1_steps=args.stage1_steps,
+                        stage2_steps=args.stage2_steps,
+                        sample_ids=chunk_indices,
+                        logger=logger,
+                    )
+                    for image_name, image_spec in chunk_images.items():
+                        if image_spec is None:
+                            continue
+                        existing_images = val_example_images.setdefault(image_name, [])
+                        if isinstance(image_spec, list):
+                            existing_images.extend(image_spec)
+                        else:
+                            existing_images.append(image_spec)
+                    del video_val, chunk_images
+                    torch.cuda.empty_cache()
                 write_experiment_images(
                     tracker,
                     args.tracking_backend,
@@ -1997,10 +2109,12 @@ def main(args):
             
             model.train()  # 回到训练模式
             torch.cuda.empty_cache()
-        
+
+        distributed_barrier()
+
         # ========== 2. 每val_interval个epoch执行：完整验证（指标+最优模型） ==========
-                # ========== 完整验证（每val_interval个epoch） ==========
-        if (epoch + 1) % args.val_interval == 0 and rank == 0:
+        # ========== 完整验证（每val_interval个epoch） ==========
+        if (epoch + 1) % args.val_interval == 0:
             model.eval()
             vae.eval()
             val_diffusion = create_diffusion(
@@ -2026,13 +2140,14 @@ def main(args):
             weights_dict = {int(k.split('_')[1]): v for k, v in stage_weights.items()}
             intervals_to_validate = sorted(weights_dict.keys())
             
-            logger.info(f"\n{'='*60}")
-            logger.info(f"开始 {stage_name} 多间隔验证 | 验证间隔: {intervals_to_validate}")
-            logger.info(f"权重分配: {weights_dict}")
-            logger.info(f"{'='*60}\n")
+            if rank == 0:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"开始 {stage_name} 多间隔验证 | 验证间隔: {intervals_to_validate}")
+                logger.info(f"权重分配: {weights_dict}")
+                logger.info(f"{'='*60}\n")
             
             # 每个间隔分别验证
-            metrics_per_interval = {}
+            metrics_per_interval = {} if rank == 0 else None
             
             for interval in intervals_to_validate:
                 # temp_step映射（保持不变）
@@ -2049,21 +2164,22 @@ def main(args):
                     
                 dataset_val.set_training_step(temp_step)
                 
-                val_mae, val_mse, val_psnr = 0.0, 0.0, 0.0
+                val_mae_sum, val_mse_sum, val_psnr_sum = 0.0, 0.0, 0.0
+                val_sample_count = 0
                 val_task = None
                 if train_progress is not None:
                     val_task = train_progress.add_task(
-                        f"Val Interval {interval}",
-                        total=len(loader_val),
+                        f"Val Interval {interval} Shard",
+                        total=max(1, len(loader_val_metrics)),
                         completed=0,
                         status=(
                             f"epoch {epoch + 1}/{num_train_epochs} | "
-                            f"{stage_name} | batch 0/{len(loader_val)}"
+                            f"{stage_name} | shard 0/{len(loader_val_metrics)} | world {world_size}"
                         ),
                     )
                 
                 with torch.no_grad():
-                    for val_step, val_batch in enumerate(loader_val):
+                    for val_step, val_batch in enumerate(loader_val_metrics):
                         video_val = val_batch['video'].to(device)
                         b_val, f_val, c_val, h_val, w_val = video_val.shape
 
@@ -2217,12 +2333,19 @@ def main(args):
                         gt_np = gt_middle.detach().cpu().numpy()
                         pred_np = pred_middle.detach().cpu().numpy()
 
-                        # ✅ 动态计算data_range
-                        data_range = max(gt_np.max() - gt_np.min(), 2.0)  # 至少为2.0
+                        gt_flat = gt_np.reshape(gt_np.shape[0], -1)
+                        pred_flat = pred_np.reshape(pred_np.shape[0], -1)
+                        mae_batch = np.mean(np.abs(pred_flat - gt_flat), axis=1)
+                        mse_batch = np.mean((pred_flat - gt_flat) ** 2, axis=1)
+                        psnr_batch = [
+                            peak_signal_noise_ratio(gt_np[idx], pred_np[idx], data_range=2.0)
+                            for idx in range(gt_np.shape[0])
+                        ]
 
-                        val_mae += np.mean(np.abs(pred_np - gt_np)) / len(loader_val)
-                        val_mse += mean_squared_error(gt_np.reshape(-1), pred_np.reshape(-1)) / len(loader_val)
-                        val_psnr += peak_signal_noise_ratio(gt_np, pred_np, data_range=2.0) / len(loader_val)
+                        val_mae_sum += float(np.sum(mae_batch))
+                        val_mse_sum += float(np.sum(mse_batch))
+                        val_psnr_sum += float(np.sum(psnr_batch))
+                        val_sample_count += int(gt_np.shape[0])
 
                         if val_task is not None:
                             train_progress.update(
@@ -2230,73 +2353,85 @@ def main(args):
                                 completed=val_step + 1,
                                 status=(
                                     f"epoch {epoch + 1}/{num_train_epochs} | "
-                                    f"{stage_name} | batch {val_step + 1}/{len(loader_val)}"
+                                    f"{stage_name} | shard {val_step + 1}/{len(loader_val_metrics)} | world {world_size}"
                                 ),
                             )
 
                 if val_task is not None:
                     train_progress.remove_task(val_task)
-                
-                metrics_per_interval[interval] = {
-                    'mae': val_mae,
-                    'mse': val_mse,
-                    'psnr': val_psnr
-                }
-                
-                logger.info(
-                    f"Interval {interval} | MAE: {val_mae:.4f} | MSE: {val_mse:.4f} | PSNR: {val_psnr:.4f}"
+
+                metrics_tensor = torch.tensor(
+                    [val_mae_sum, val_mse_sum, val_psnr_sum, float(val_sample_count)],
+                    device=device,
+                    dtype=torch.float64,
                 )
+                if world_size > 1:
+                    dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+
+                total_val_count = max(int(metrics_tensor[3].item()), 1)
+                val_mae = metrics_tensor[0].item() / total_val_count
+                val_mse = metrics_tensor[1].item() / total_val_count
+                val_psnr = metrics_tensor[2].item() / total_val_count
                 
-                # 写入tensorboard（分间隔）
-                write_experiment_metric(tracker, args.tracking_backend, f'Val_Interval{interval}/MAE', val_mae, epoch+1)
-                write_experiment_metric(tracker, args.tracking_backend, f'Val_Interval{interval}/MSE', val_mse, epoch+1)
-                write_experiment_metric(tracker, args.tracking_backend, f'Val_Interval{interval}/PSNR', val_psnr, epoch+1)
+                if rank == 0:
+                    metrics_per_interval[interval] = {
+                        'mae': val_mae,
+                        'mse': val_mse,
+                        'psnr': val_psnr
+                    }
+                    
+                    logger.info(
+                        f"Interval {interval} | MAE: {val_mae:.4f} | MSE: {val_mse:.4f} | PSNR: {val_psnr:.4f}"
+                    )
+                    
+                    write_experiment_metric(tracker, args.tracking_backend, f'Val_Interval{interval}/MAE', val_mae, train_steps)
+                    write_experiment_metric(tracker, args.tracking_backend, f'Val_Interval{interval}/MSE', val_mse, train_steps)
+                    write_experiment_metric(tracker, args.tracking_backend, f'Val_Interval{interval}/PSNR', val_psnr, train_steps)
             
-            # 计算加权综合指标
-            weighted_mae = sum(metrics_per_interval[i]['mae'] * weights_dict[i] for i in intervals_to_validate)
-            weighted_mse = sum(metrics_per_interval[i]['mse'] * weights_dict[i] for i in intervals_to_validate)
-            weighted_psnr = sum(metrics_per_interval[i]['psnr'] * weights_dict[i] for i in intervals_to_validate)
-            
-            val_metric = (weighted_mae + weighted_mse) / 2
-            
-            logger.info(f"\n{'='*60}")
-            logger.info(
-                f"Epoch {epoch+1} {stage_name} 加权综合验证 | "
-                f"MAE: {weighted_mae:.4f} | MSE: {weighted_mse:.4f} | "
-                f"PSNR: {weighted_psnr:.4f} | Metric: {val_metric:.4f} | "
-                f"Best: {best_val_metric:.4f}"
-            )
-            logger.info(f"{'='*60}\n")
-            
-            write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/MAE', weighted_mae, epoch+1)
-            write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/MSE', weighted_mse, epoch+1)
-            write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/PSNR', weighted_psnr, epoch+1)
-            write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/Metric', val_metric, epoch+1)
-            
-            # 保存最优模型（保持原逻辑）
-            if val_metric < best_val_metric:
-                prev_best = best_val_metric
-                best_val_metric = val_metric
-                checkpoint = {
-                    "model": get_raw_model(model).state_dict(),
-                    "ema": ema.state_dict(),
-                    "val_metric": val_metric,
-                    "epoch": epoch+1,
-                    "train_steps": train_steps,
-                    "prev_best_metric": prev_best,
-                    "stage": stage_name,
-                    "metrics_per_interval": metrics_per_interval
-                }
-                best_ckpt_path = f"{checkpoint_dir}/best_epoch_train_model.pth"
-                torch.save(checkpoint, best_ckpt_path)
-                del checkpoint
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+            if rank == 0:
+                weighted_mae = sum(metrics_per_interval[i]['mae'] * weights_dict[i] for i in intervals_to_validate)
+                weighted_mse = sum(metrics_per_interval[i]['mse'] * weights_dict[i] for i in intervals_to_validate)
+                weighted_psnr = sum(metrics_per_interval[i]['psnr'] * weights_dict[i] for i in intervals_to_validate)
+                
+                val_metric = (weighted_mae + weighted_mse) / 2
+                
+                logger.info(f"\n{'='*60}")
                 logger.info(
-                    f"✅ 保存最优模型到 {best_ckpt_path} | "
-                    f"新最优指标: {val_metric:.4f} (之前: {prev_best:.4f}) | "
-                    f"提升: {prev_best - val_metric:.4f}"
+                    f"Epoch {epoch+1} {stage_name} 加权综合验证 | "
+                    f"MAE: {weighted_mae:.4f} | MSE: {weighted_mse:.4f} | "
+                    f"PSNR: {weighted_psnr:.4f} | Metric: {val_metric:.4f} | "
+                    f"Best: {best_val_metric:.4f}"
                 )
+                logger.info(f"{'='*60}\n")
+                
+                write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/MAE', weighted_mae, train_steps)
+                write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/MSE', weighted_mse, train_steps)
+                write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/PSNR', weighted_psnr, train_steps)
+                write_experiment_metric(tracker, args.tracking_backend, 'Val_Weighted/Metric', val_metric, train_steps)
+                
+                if val_metric < best_val_metric:
+                    prev_best = best_val_metric
+                    best_val_metric = val_metric
+                    checkpoint = {
+                        "model": get_raw_model(model).state_dict(),
+                        "ema": ema.state_dict(),
+                        "val_metric": val_metric,
+                        "epoch": epoch+1,
+                        "train_steps": train_steps,
+                        "prev_best_metric": prev_best,
+                        "stage": stage_name,
+                        "metrics_per_interval": metrics_per_interval
+                    }
+                    best_ckpt_path = f"{checkpoint_dir}/best_epoch_train_model.pth"
+                    torch.save(checkpoint, best_ckpt_path)
+                    del checkpoint
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                    logger.info(
+                        f"✅ 保存最优模型到 {best_ckpt_path} | "
+                        f"新最优指标: {val_metric:.4f} (之前: {prev_best:.4f}) | "
+                        f"提升: {prev_best - val_metric:.4f}"
+                    )
             
             # 恢复dataset的真实训练步数
             dataset_val.set_training_step(train_steps)

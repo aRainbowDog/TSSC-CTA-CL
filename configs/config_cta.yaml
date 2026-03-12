@@ -52,6 +52,9 @@ log_every: 200
 lr_warmup_steps: 0
 gradient_accumulation_steps: 32
 ddp_timeout_minutes: 180
+cuda_empty_cache_interval: 100
+val_visualization_count: 20
+val_visualization_batch_size: 4
 num_classes: 1
 
 # low VRAM and speed up training
@@ -92,7 +95,7 @@ curriculum_learning:
     stage0:
       interval_1: 1.0
     stage1:
-      interval_2: 1.0  # 修正：之前写成interval_1
+      interval_2: 1.0
     stage2:
       interval_2: 0.3
       interval_4: 0.7
