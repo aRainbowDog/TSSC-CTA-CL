@@ -244,3 +244,83 @@ class data_loader(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.video_lists)
+
+
+class full_sequence_data_loader(torch.utils.data.Dataset):
+    """加载完整CTA序列，用于滑窗三连帧评测。"""
+
+    def __init__(self, configs, stage):
+        if stage not in ['val', 'test']:
+            raise ValueError(f"full_sequence_data_loader 只支持 val/test，当前为 {stage}")
+
+        self.stage = stage
+        self.configs = configs
+        self.v_decoder = DecordInit()
+
+        self.transform = transforms.Compose([
+            ToTensorVideo(),
+            CenterCropResizeVideo(configs.image_size),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+
+        if self.stage == 'val':
+            self.data_path = configs.data_path_train
+            all_videos = get_filelist(self.data_path)
+            len_train = int(0.9 * len(all_videos))
+            self.video_lists = all_videos[len_train:]
+        else:
+            self.data_path = configs.data_path_test
+            self.video_lists = get_filelist(self.data_path)
+
+        if is_main_process():
+            print(f"[{self.stage}] 滑窗评测视频数量: {len(self.video_lists)}")
+
+    def _read_video_safe(self, video_path):
+        try:
+            vframes, _, _ = torchvision.io.read_video(
+                filename=video_path,
+                pts_unit='sec',
+                output_format='TCHW',
+                pts_per_second=15
+            )
+            return vframes
+        except Exception:
+            reader = self.v_decoder(video_path)
+            frames = reader.get_batch(list(range(len(reader)))).asnumpy()
+            frames = torch.from_numpy(frames).permute(0, 3, 1, 2)
+            return frames
+
+    def __getitem__(self, index):
+        path = self.video_lists[index]
+        file_name = os.path.basename(path)
+        patient_dir = os.path.dirname(path)
+        patient_name = os.path.basename(patient_dir)
+
+        slice_match = re.search(r'slice_(\d+)', file_name)
+        if slice_match:
+            video_name = f"{patient_name}_slice_{int(slice_match.group(1)):02d}"
+        else:
+            video_name = os.path.splitext(file_name)[0]
+
+        vframes = self._read_video_safe(path).to(torch.uint8)
+        video = self.transform(vframes)
+
+        return {
+            'video': video,  # [T, C, H, W]
+            'video_name': video_name,
+            'video_path': path,
+            'num_frames': video.shape[0],
+        }
+
+    def __len__(self):
+        return len(self.video_lists)
+
+
+def collate_full_sequence_batch(batch):
+    """保留可变长度视频列表，避免默认collate强行stack失败。"""
+    return {
+        'videos': [item['video'] for item in batch],
+        'video_name': [item['video_name'] for item in batch],
+        'video_path': [item['video_path'] for item in batch],
+        'num_frames': [item['num_frames'] for item in batch],
+    }

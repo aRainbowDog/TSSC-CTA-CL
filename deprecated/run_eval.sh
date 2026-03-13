@@ -19,7 +19,7 @@ do
     echo "正在启动: $METHOD (使用 GPU: $GPU_ID)"
     
     # 使用 CUDA_VISIBLE_DEVICES 限制该进程只能看到指定的 GPU
-    CUDA_VISIBLE_DEVICES=$GPU_ID python -u EvaluateMetric.py \
+    CUDA_VISIBLE_DEVICES=$GPU_ID python -u deprecated/EvaluateMetric.py \
         --method "$METHOD" \
         --output "$OUTPUT_DIR" \
         --device "cuda" > "${OUTPUT_DIR}/${METHOD}_run.log" 2>&1 &
