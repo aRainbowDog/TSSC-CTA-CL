@@ -46,7 +46,7 @@ max_train_steps: 8000
 timestep_respacing_train: ""
 timestep_respacing_val: "ddim20"
 timestep_respacing_test: "ddim50"
-val_interval: 20
+val_interval: 10
 global_seed: 3407
 num_workers: 8
 log_every: 200
@@ -62,7 +62,6 @@ num_classes: 1
 # low VRAM and speed up training
 use_compile: false
 mixed_precision: True
-enable_xformers_memory_efficient_attention: False
 gradient_checkpointing: True
 
 # ========== 课程学习（修正后） ==========

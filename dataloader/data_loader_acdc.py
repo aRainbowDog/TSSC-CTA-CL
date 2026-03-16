@@ -1,4 +1,5 @@
 # 相邻3帧的灰度图 - 四阶段课程学习（阶段0用伪GT）
+import logging
 import os
 import torch
 import decord
@@ -21,6 +22,7 @@ except ImportError:
 
 class_labels_map = None
 cls_sample_cnt = None
+logger = logging.getLogger(__name__)
 
 
 def is_main_process():
@@ -39,6 +41,80 @@ def get_filelist(file_path):
             if filename.lower().endswith(video_ext):
                 Filelist.append(os.path.join(home, filename))
     return sorted(Filelist)
+
+
+def _group_videos_by_parent(file_path, video_paths):
+    grouped_videos = {}
+    for video_path in video_paths:
+        group_key = os.path.relpath(os.path.dirname(video_path), file_path)
+        grouped_videos.setdefault(group_key, []).append(video_path)
+    return grouped_videos
+
+
+def split_train_val_videos(file_path, seed, train_ratio=0.9):
+    """Deterministically split videos by parent folder first, falling back to per-file shuffle."""
+    all_videos = get_filelist(file_path)
+    if not all_videos:
+        return [], []
+
+    grouped_videos = _group_videos_by_parent(file_path, all_videos)
+    rng = random.Random(int(seed))
+    group_keys = sorted(grouped_videos)
+    if len(group_keys) > 1:
+        rng.shuffle(group_keys)
+        num_train_groups = int(len(group_keys) * train_ratio)
+        num_train_groups = min(max(1, num_train_groups), len(group_keys) - 1)
+        train_group_keys = set(group_keys[:num_train_groups])
+        train_videos = []
+        val_videos = []
+        for group_key in group_keys:
+            target_list = train_videos if group_key in train_group_keys else val_videos
+            target_list.extend(sorted(grouped_videos[group_key]))
+        return train_videos, val_videos
+
+    shuffled_videos = list(all_videos)
+    rng.shuffle(shuffled_videos)
+    len_train = int(train_ratio * len(shuffled_videos))
+    if len(shuffled_videos) > 1:
+        len_train = min(max(1, len_train), len(shuffled_videos) - 1)
+    return shuffled_videos[:len_train], shuffled_videos[len_train:]
+
+
+def build_train_val_split_manifest(file_path, seed, train_ratio=0.9):
+    """Return a JSON-serializable manifest for the deterministic train/val split."""
+    train_videos, val_videos = split_train_val_videos(file_path, seed=seed, train_ratio=train_ratio)
+    train_groups = _group_videos_by_parent(file_path, train_videos)
+    val_groups = _group_videos_by_parent(file_path, val_videos)
+
+    def _serialize_split(split_name, grouped_videos):
+        groups = []
+        for group_key in sorted(grouped_videos):
+            rel_videos = [os.path.relpath(video_path, file_path) for video_path in sorted(grouped_videos[group_key])]
+            groups.append({
+                "group": group_key,
+                "video_count": len(rel_videos),
+                "videos": rel_videos,
+            })
+        return {
+            "name": split_name,
+            "group_count": len(groups),
+            "video_count": sum(group["video_count"] for group in groups),
+            "groups": groups,
+        }
+
+    all_videos = get_filelist(file_path)
+    grouped_all = _group_videos_by_parent(file_path, all_videos)
+    split_strategy = "group_by_parent_dir_deterministic_shuffle" if len(grouped_all) > 1 else "per_file_deterministic_shuffle"
+    return {
+        "data_path": os.path.abspath(file_path),
+        "seed": int(seed),
+        "train_ratio": float(train_ratio),
+        "split_strategy": split_strategy,
+        "total_group_count": len(grouped_all),
+        "total_video_count": len(all_videos),
+        "train": _serialize_split("train", train_groups),
+        "val": _serialize_split("val", val_groups),
+    }
 
 class DecordInit(object):
     """Using Decord to initialize the video_reader"""
@@ -103,7 +179,7 @@ class data_loader(torch.utils.data.Dataset):
             self.stage3_gap, self.stage3_frames = 8, 9
 
         if is_main_process():
-            print(f"[{self.stage}] 四阶段模式 | Gap: {self.stage0_gap}/{self.stage1_gap}/{self.stage2_gap}/{self.stage3_gap}")
+            logger.info(f"[{self.stage}] 四阶段模式 | Gap: {self.stage0_gap}/{self.stage1_gap}/{self.stage2_gap}/{self.stage3_gap}")
         
         self.v_decoder = DecordInit()
         
@@ -120,12 +196,14 @@ class data_loader(torch.utils.data.Dataset):
         # 划分数据集
         if self.stage in ['train', 'val']:
             self.data_path = configs.data_path_train
-            all_videos = get_filelist(self.data_path)
-            len_train = int(0.9 * len(all_videos))
+            train_videos, val_videos = split_train_val_videos(
+                self.data_path,
+                seed=getattr(configs, "global_seed", 3407),
+            )
             if self.stage == 'train':
-                self.video_lists = all_videos[:len_train]
+                self.video_lists = train_videos
             else:
-                self.video_lists = all_videos[len_train:]
+                self.video_lists = val_videos
         elif self.stage == 'test':
             self.data_path = configs.data_path_test
             self.video_lists = get_filelist(self.data_path)
@@ -133,7 +211,7 @@ class data_loader(torch.utils.data.Dataset):
             raise ValueError(f"stage 必须是 train/val/test，当前为 {self.stage}")
         
         if is_main_process():
-            print(f"[{self.stage}] 加载视频数量: {len(self.video_lists)}")
+            logger.info(f"[{self.stage}] 加载视频数量: {len(self.video_lists)}")
 
     def set_training_step(self, step):
         """从训练循环中设置当前步数"""
@@ -145,8 +223,7 @@ class data_loader(torch.utils.data.Dataset):
             vframes, aframes, info = torchvision.io.read_video(
                 filename=video_path, 
                 pts_unit='sec', 
-                output_format='TCHW',
-                pts_per_second=15
+                output_format='TCHW'
             )
             return vframes
         except Exception as e:
@@ -265,23 +342,23 @@ class full_sequence_data_loader(torch.utils.data.Dataset):
 
         if self.stage == 'val':
             self.data_path = configs.data_path_train
-            all_videos = get_filelist(self.data_path)
-            len_train = int(0.9 * len(all_videos))
-            self.video_lists = all_videos[len_train:]
+            _, self.video_lists = split_train_val_videos(
+                self.data_path,
+                seed=getattr(configs, "global_seed", 3407),
+            )
         else:
             self.data_path = configs.data_path_test
             self.video_lists = get_filelist(self.data_path)
 
         if is_main_process():
-            print(f"[{self.stage}] 滑窗评测视频数量: {len(self.video_lists)}")
+            logger.info(f"[{self.stage}] 滑窗评测视频数量: {len(self.video_lists)}")
 
     def _read_video_safe(self, video_path):
         try:
             vframes, _, _ = torchvision.io.read_video(
                 filename=video_path,
                 pts_unit='sec',
-                output_format='TCHW',
-                pts_per_second=15
+                output_format='TCHW'
             )
             return vframes
         except Exception:

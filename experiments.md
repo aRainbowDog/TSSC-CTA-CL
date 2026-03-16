@@ -39,7 +39,7 @@ CUDA_VISIBLE_DEVICES=0 python train_CurriculumLearning.py --config configs/confi
 Recommended multi-GPU training command:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 torchrun --standalone --nproc_per_node=7 train_CurriculumLearning.py --config configs/config_cta.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node=8 train_CurriculumLearning.py --config configs/config_cta.yaml
 ```
 
 Notes:

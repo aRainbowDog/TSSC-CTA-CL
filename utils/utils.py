@@ -144,8 +144,6 @@ def get_experiment_dir(root_dir, args):
         root_dir += '-Compile'  # speedup by torch compile
     if args.fixed_spatial:
         root_dir += '-FixedSpa'
-    if args.enable_xformers_memory_efficient_attention:
-        root_dir += '-Xfor'
     if args.gradient_checkpointing:
         root_dir += '-Gc'
     if args.mixed_precision:
@@ -354,6 +352,26 @@ def write_experiment_images(tracker, backend, images, step):
             payload[name] = wandb.Image(image_path, caption=caption)
         if payload:
             tracker.log(payload, step=step)
+        return
+
+    raise ValueError(f"Unsupported tracking backend: {backend}")
+
+
+def write_experiment_artifact(tracker, backend, artifact_name, artifact_path, artifact_type="artifact", metadata=None):
+    """Persist a file as an experiment artifact when supported by the backend."""
+    if dist.get_rank() != 0 or tracker is None:
+        return
+    if artifact_path is None or not os.path.exists(artifact_path):
+        return
+
+    backend = str(backend).lower()
+    if backend == "tensorboard":
+        return
+
+    if backend == "wandb":
+        artifact = wandb.Artifact(artifact_name, type=artifact_type, metadata=metadata)
+        artifact.add_file(artifact_path)
+        tracker.log_artifact(artifact)
         return
 
     raise ValueError(f"Unsupported tracking backend: {backend}")

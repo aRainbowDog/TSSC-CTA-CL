@@ -1,8 +1,8 @@
 # autodl
+import warnings
 import os
 import gc
-# 临时开启expandable_segments（加载阶段用，训练时再关闭）
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+import json
 import math
 import argparse
 import logging
@@ -35,6 +35,7 @@ from models.diffusion.gaussian_diffusion import (
     ModelVarType,
 )
 from dataloader.data_loader_acdc import (
+    build_train_val_split_manifest,
     collate_full_sequence_batch,
     data_loader,
     full_sequence_data_loader,
@@ -49,9 +50,8 @@ from utils.triplet_eval import evaluate_video_sliding_triplets
 from utils.utils import (
     clip_grad_norm_, create_logger, update_ema, requires_grad, 
     cleanup, create_experiment_tracker, write_experiment_metric,
-    write_experiment_images, close_experiment_tracker, setup_distributed
+    write_experiment_artifact, write_experiment_images, close_experiment_tracker, setup_distributed
 )
-import warnings
 # ========== 新增mask生成相关依赖 ==========
 import cv2
 import matplotlib.pyplot as plt
@@ -1335,7 +1335,7 @@ def main(args):
     torch.cuda.set_device(device)  # 绑定当前进程到local_rank对应的GPU
     cuda_empty_cache_interval = int(getattr(args, "cuda_empty_cache_interval", 100))
 
-    # 2. 显存优化配置（加载阶段开启expandable_segments，训练时关闭）
+    # 2. 显存优化配置
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = False  # 关闭benchmark减少显存预分配
@@ -1395,6 +1395,37 @@ def main(args):
         logger.info(f"Tracking backend: {tracking_backend}")
         logger.info(f"Sliding triplet eval batch size: {triplet_eval_batch_size}")
         logger.info(f"Validation sampler respacing: {timestep_respacing_val}")
+        split_manifest = build_train_val_split_manifest(
+            args.data_path_train,
+            seed=getattr(args, "global_seed", 3407),
+        )
+        split_manifest_path = os.path.join(experiment_dir, "train_val_split_manifest.json")
+        with open(split_manifest_path, "w", encoding="utf-8") as split_manifest_file:
+            json.dump(split_manifest, split_manifest_file, ensure_ascii=False, indent=2)
+        logger.info(
+            "Data split saved: %s | train groups=%d videos=%d | val groups=%d videos=%d",
+            split_manifest_path,
+            split_manifest["train"]["group_count"],
+            split_manifest["train"]["video_count"],
+            split_manifest["val"]["group_count"],
+            split_manifest["val"]["video_count"],
+        )
+        write_experiment_artifact(
+            tracker,
+            tracking_backend,
+            artifact_name=f"{os.path.basename(experiment_dir)}-train-val-split",
+            artifact_path=split_manifest_path,
+            artifact_type="data_split",
+            metadata={
+                "seed": split_manifest["seed"],
+                "train_ratio": split_manifest["train_ratio"],
+                "split_strategy": split_manifest["split_strategy"],
+                "train_group_count": split_manifest["train"]["group_count"],
+                "train_video_count": split_manifest["train"]["video_count"],
+                "val_group_count": split_manifest["val"]["group_count"],
+                "val_video_count": split_manifest["val"]["video_count"],
+            },
+        )
     else:
         logger = create_logger_compat(None, level=log_level, console=shared_console)
         tracker = None
@@ -1554,11 +1585,6 @@ def main(args):
                 module.gradient_checkpointing_enable()
         model.apply(enable_ckpt)
 
-    if args.enable_xformers_memory_efficient_attention:
-        if rank == 0:
-            logger.info("Using Xformers memory-efficient attention")
-        model.enable_xformers_memory_efficient_attention()
-
     # 8. DDP包装（多卡时）
     if world_size > 1:
         model = DDP(
@@ -1589,8 +1615,8 @@ def main(args):
     lr_scheduler = get_scheduler(
         name="constant",
         optimizer=opt,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps,
     )
 
     # 10. 数据加载器
@@ -1608,11 +1634,9 @@ def main(args):
         batch_size=args.train_batch_size,
         shuffle=False,
         sampler=sampler_train,
-        # num_workers=args.num_workers,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
-        # prefetch_factor=2  # 预取优化
     )
     train_batches_per_epoch = len(loader_train)
     train_updates_per_epoch = max(1, math.ceil(train_batches_per_epoch / args.gradient_accumulation_steps))
@@ -1631,7 +1655,7 @@ def main(args):
         batch_size=args.val_batch_size,
         shuffle=False,
         sampler=sampler_val_metrics,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=True,
         drop_last=False,
         collate_fn=collate_full_sequence_batch,
@@ -1642,11 +1666,9 @@ def main(args):
             dataset_val_vis,
             batch_size=args.val_batch_size,
             shuffle=False,
-            # num_workers=args.num_workers,
-            num_workers=0,
+            num_workers=args.num_workers,
             pin_memory=True,
             drop_last=False,
-            # prefetch_factor=2
         )
 
     if rank == 0:
@@ -1738,11 +1760,7 @@ def main(args):
             if rank == 0:
                 logger.warning(f"Checkpoint {latest_ckpt} not found, start from scratch")
 
-    # 续训完成后：关闭expandable_segments + 模型编译
-    # 1. 关闭expandable_segments（训练阶段用）
-    torch.backends.cuda.expandable_segments = False
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:False'
-    # 2. 延迟编译模型（避免加载阶段占用显存）
+    # 续训完成后：延迟编译模型（避免加载阶段占用显存）
     if args.use_compile and torch.cuda.is_available():
         if rank == 0:
             logger.info("Compiling model with torch.compile (delayed)")

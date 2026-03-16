@@ -3,6 +3,8 @@ import datetime
 import os
 import warnings
 
+warnings.filterwarnings("ignore")
+
 import torch
 import torch.distributed as dist
 from diffusers.models import AutoencoderKL
@@ -18,8 +20,6 @@ from utils.triplet_eval import (
     evaluate_video_sliding_triplets_baseline,
 )
 from utils.utils import cleanup, setup_distributed
-
-warnings.filterwarnings("ignore")
 
 
 class DistributedEvalSampler(Sampler):
