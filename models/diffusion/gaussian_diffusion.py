@@ -677,9 +677,6 @@ class GaussianDiffusion:
 
         if self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             x_t = x_t.permute(0, 2, 1, 3, 4)    # [b, f, c, h, w]
-            print("🌙❤x_start.permute(1,0,2,3,4) shape:", x_start.permute(1,0,2,3,4).shape)
-            print("mask shape:", mask.shape)
-            print("x_t.permute(2,0,1,3,4) shape:", x_t.permute(2,0,1,3,4).shape)
             # mask, C B T H W
             model_input = x_start.permute(1, 0, 2, 3, 4) * (1-mask) + x_t.permute(2, 0, 1, 3, 4) * mask
             # C B T H W -> B T C H W

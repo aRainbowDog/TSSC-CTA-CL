@@ -185,9 +185,11 @@ def main(args):
         pretrained_dict = {}
 
         if not baseline_method:
+            learn_sigma = bool(getattr(args, "learn_sigma", True))
             diffusion = create_diffusion(
                 timestep_respacing=respacing,
                 diffusion_steps=args.diffusion_steps,
+                learn_sigma=learn_sigma,
             )
             vae = AutoencoderKL.from_pretrained(
                 args.pretrained_vae_model_path,
@@ -201,6 +203,7 @@ def main(args):
             model = MVIF_models[args.model](
                 input_size=latent_size,
                 num_classes=args.num_classes,
+                learn_sigma=learn_sigma,
                 **additional_kwargs,
             ).to(device)
 

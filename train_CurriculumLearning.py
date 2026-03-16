@@ -28,7 +28,12 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from models.model_dit import MVIF_models
-from models.diffusion.gaussian_diffusion import create_diffusion, ModelMeanType
+from models.diffusion.gaussian_diffusion import (
+    create_diffusion,
+    LossType,
+    ModelMeanType,
+    ModelVarType,
+)
 from dataloader.data_loader_acdc import (
     collate_full_sequence_batch,
     data_loader,
@@ -477,22 +482,66 @@ def set_optimizer_zeros_grad(optimizer, set_to_none=True):
 
 def safe_load_checkpoint(ckpt_path, device):
     """
-    安全加载checkpoint：只加载model/ema，跳过opt，避免OOM
+    加载训练checkpoint到CPU，后续按需恢复到目标device。
     """
-    # 1. 加载到CPU，避免GPU瞬间占用
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    # 2. 只保留必要的key，删除opt和冗余数据
-    keep_keys = ["model", "ema", "train_steps", "best_val_metric"]
-    for k in list(checkpoint.keys()):
-        if k not in keep_keys:
-            del checkpoint[k]
-    # 3. model/ema参数移到GPU（逐个加载）
-    for k in ["model", "ema"]:
-        if k in checkpoint and checkpoint[k] is not None:
-            for param_key in checkpoint[k]:
-                if isinstance(checkpoint[k][param_key], torch.Tensor):
-                    checkpoint[k][param_key] = checkpoint[k][param_key].to(device, non_blocking=True)
+    del device
+    return torch.load(ckpt_path, map_location="cpu")
+
+
+def move_optimizer_state_to_device(optimizer, device):
+    """Ensure optimizer state tensors live on the same device as model params after resume."""
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device, non_blocking=True)
+
+
+def build_training_checkpoint(
+    model,
+    ema,
+    train_steps,
+    epoch,
+    best_val_metric,
+    opt=None,
+    lr_scheduler=None,
+    scaler=None,
+):
+    checkpoint = {
+        "model": get_raw_model(model).state_dict(),
+        "ema": ema.state_dict(),
+        "train_steps": train_steps,
+        "epoch": epoch,
+        "best_val_metric": best_val_metric,
+    }
+    if opt is not None:
+        checkpoint["opt"] = opt.state_dict()
+    if lr_scheduler is not None:
+        checkpoint["lr_scheduler"] = lr_scheduler.state_dict()
+    if scaler is not None:
+        checkpoint["scaler"] = scaler.state_dict()
     return checkpoint
+
+
+def align_weight_batch(weight_batch, batch_size, num_channels, height, width):
+    """Accept [B,1,H,W] or [B,C,H,W] weights and expand to [B,C,H,W] for loss weighting."""
+    if weight_batch is None:
+        return None
+    if weight_batch.dim() == 3:
+        weight_batch = weight_batch.unsqueeze(1)
+    if weight_batch.dim() != 4:
+        raise ValueError(f"weight_batch must be 3D or 4D, got shape {tuple(weight_batch.shape)}")
+    if weight_batch.shape[0] != batch_size or weight_batch.shape[-2:] != (height, width):
+        raise ValueError(
+            f"weight_batch shape {tuple(weight_batch.shape)} is incompatible with target "
+            f"({batch_size}, {num_channels}, {height}, {width})"
+        )
+    if weight_batch.shape[1] == 1:
+        return weight_batch.expand(-1, num_channels, -1, -1)
+    if weight_batch.shape[1] != num_channels:
+        raise ValueError(
+            f"weight_batch channel dim must be 1 or {num_channels}, got {weight_batch.shape[1]}"
+        )
+    return weight_batch
 
 # 新增：EMA decay调度函数（关键优化）
 def get_ema_decay(train_steps, base_decay=0.9999, min_decay=0.99, warmup_steps=1000):
@@ -1105,10 +1154,10 @@ def compute_triplet_loss(
     # 使用diffusion的前向过程添加噪声
     latent_permuted = latent_triplet.permute(0, 2, 1, 3, 4)  # [B, C, 3, H, W]
     noise = torch.randn_like(latent_permuted)
-    x_t = diffusion.q_sample(latent_permuted, t, noise=noise)  # [B, C, 3, H, W]
+    x_t_bcfhw = diffusion.q_sample(latent_permuted, t, noise=noise)  # [B, C, 3, H, W]
     
     # 恢复到 [B, 3, C, H, W] 供模型输入
-    x_t = x_t.permute(0, 2, 1, 3, 4)  # [B, 3, C, H, W]
+    x_t = x_t_bcfhw.permute(0, 2, 1, 3, 4)  # [B, 3, C, H, W]
     
     # 构建输入：首尾用GT，中间用噪声
     # mask: [B, 3, H, W]，0表示可见（GT），1表示预测（噪声）
@@ -1116,10 +1165,28 @@ def compute_triplet_loss(
     
     # 模型forward
     model_output = model(model_input, t)  # [B, 3, C_out, H, W]
+    vb_loss = None
     
-    # ===== 关键修正：通过形状判断是否需要分离 =====
-    if model_output.shape[2] == c * 2:  # 如果输出通道数是输入的2倍（learn_sigma=True）
-        model_output, _ = torch.split(model_output, c, dim=2)  # 分离均值和方差，取均值
+    if diffusion.model_var_type in {ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE}:
+        if model_output.shape[2] != c * 2:
+            raise ValueError(
+                f"Expected model output channels {c * 2} for learned sigma, got {model_output.shape[2]}"
+            )
+        model_output, model_var_values = torch.split(model_output, c, dim=2)
+        frozen_out = torch.cat([model_output.detach(), model_var_values], dim=2).permute(0, 2, 1, 3, 4)
+        vb_loss = diffusion._vb_terms_bpd(
+            model=lambda *args, r=frozen_out: r,
+            x_start=latent_permuted,
+            x_t=x_t_bcfhw,
+            t=t,
+            clip_denoised=False,
+        )["output"].mean()
+        if diffusion.loss_type == LossType.RESCALED_MSE:
+            vb_loss = vb_loss * diffusion.num_timesteps / 1000.0
+    elif model_output.shape[2] != c:
+        raise ValueError(
+            f"Expected model output channels {c} for fixed sigma, got {model_output.shape[2]}"
+        )
     
     pred_middle_raw = model_output[:, 1, :, :, :]  # [B, C, H, W]
     x_t_middle = x_t[:, 1, :, :, :]  # [B, C, H, W]
@@ -1141,10 +1208,15 @@ def compute_triplet_loss(
     
     # 血管mask加权
     if weight_batch is not None:
+        weight_batch = align_weight_batch(weight_batch, b, pred_middle.shape[1], h, w)
         weight_mean = weight_batch.mean()
         loss_middle = loss_middle * weight_batch * (1.0 / weight_mean)
-    
-    return loss_middle.mean()
+
+    total_loss = loss_middle.mean()
+    if vb_loss is not None:
+        total_loss = total_loss + vb_loss
+
+    return total_loss
 
 # ========== 快速预测中间帧（无梯度） ==========
 @torch.no_grad()
@@ -1328,6 +1400,7 @@ def main(args):
         tracker = None
 
     # ========== 读取课程学习配置 ==========
+    cl_config = None
     if hasattr(args, 'curriculum_learning') and args.curriculum_learning is not None:
         cl_config = args.curriculum_learning
         stage0_steps = cl_config.get('stage0_steps', 5)  # 新增
@@ -1365,6 +1438,7 @@ def main(args):
             f"triplet_loss_mode must be one of {sorted(valid_triplet_loss_modes)}, got {triplet_loss_mode}"
         )
     args.triplet_loss_mode = triplet_loss_mode
+    args.learn_sigma = bool(getattr(args, "learn_sigma", True))
 
     # 打印配置
     if rank == 0:
@@ -1406,6 +1480,7 @@ def main(args):
     model = MVIF_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
+        learn_sigma=args.learn_sigma,
         **additional_kwargs
     )
     # 移到GPU（非阻塞）
@@ -1600,23 +1675,29 @@ def main(args):
         latest_ckpt = os.path.join(checkpoint_dir, "latest_epoch_train_model.pth")
         if os.path.exists(latest_ckpt):
             if rank == 0:
-                logger.info(f"Resuming from checkpoint (memory optimized): {latest_ckpt}")
+                logger.info(f"Resuming from checkpoint: {latest_ckpt}")
                 # 打印当前显存状态
                 logger.info(f"Memory before load: {torch.cuda.memory_allocated(device)/1024**3:.2f} GiB")
             
-            # 1. 安全加载checkpoint（只加载model/ema，跳过opt）
+            # 1. 先加载checkpoint到CPU，避免GPU瞬间峰值
             checkpoint = safe_load_checkpoint(latest_ckpt, device)
             
-            # 2. 加载model（唯一的GPU显存占用）
+            # 2. 恢复权重
             get_raw_model(model).load_state_dict(checkpoint["model"])
-            # 强制清理显存
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            
-            # 3. 加载EMA模型（关键：续训时正确加载EMA）
             if "ema" in checkpoint and checkpoint["ema"] is not None:
                 ema.load_state_dict(checkpoint["ema"])
                 ema.eval()  # 重新设置为eval模式
+
+            # 3. 恢复优化器/调度器/AMP状态
+            restored_opt_state = False
+            if checkpoint.get("opt") is not None:
+                opt.load_state_dict(checkpoint["opt"])
+                move_optimizer_state_to_device(opt, device)
+                restored_opt_state = True
+            if checkpoint.get("lr_scheduler") is not None:
+                lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+            if scaler is not None and checkpoint.get("scaler") is not None:
+                scaler.load_state_dict(checkpoint["scaler"])
             
             # 4. 读取元数据（核心修复：先赋值train_steps）
             train_steps = checkpoint.get("train_steps", 0)  # 先拿到checkpoint里的训练步数
@@ -1649,7 +1730,10 @@ def main(args):
                 logger.info(f"Resumed actual epoch: {first_epoch}, batch step: {resume_step}")
                 logger.info(f"Resumed optimizer steps: {train_steps}")
                 logger.info(f"Memory after load: {torch.cuda.memory_allocated(device)/1024**3:.2f} GiB")
-                logger.warning("跳过了优化器状态加载，优化器将从头开始（学习率不变）")
+                if restored_opt_state:
+                    logger.info("Optimizer/scheduler/scaler state restored")
+                else:
+                    logger.warning("Checkpoint missing optimizer state; resumed with fresh optimizer/scheduler")
         else:
             if rank == 0:
                 logger.warning(f"Checkpoint {latest_ckpt} not found, start from scratch")
@@ -1667,7 +1751,8 @@ def main(args):
     # ========== 创建快速采样器（用于递归链） ==========
     val_diffusion = create_diffusion(
         timestep_respacing=f"ddim{args.recursive_sampling_steps}",
-        diffusion_steps=args.diffusion_steps
+        diffusion_steps=args.diffusion_steps,
+        learn_sigma=args.learn_sigma,
     )
     if rank == 0:
         logger.info(f"递归链采样器: DDIM{args.recursive_sampling_steps}步")
@@ -1723,7 +1808,8 @@ def main(args):
         
         diffusion = create_diffusion(
             timestep_respacing=args.timestep_respacing_train,
-            diffusion_steps=args.diffusion_steps
+            diffusion_steps=args.diffusion_steps,
+            learn_sigma=args.learn_sigma,
         )
         diffusion.training = True
 
@@ -1782,7 +1868,7 @@ def main(args):
                     _, soft_weight_np = generate_vessel_mask_adaptive(frames_gray, max_weight=vessel_max_weight)
                     weight_latent = prepare_mask_for_latent(soft_weight_np, h_latent, device)
                     weight_list.append(weight_latent)
-                weight_batch = torch.cat(weight_list, dim=0).squeeze(1).repeat(1, c_latent, 1, 1)
+                weight_batch = torch.cat(weight_list, dim=0)
 
             should_step = (
                 ((step + 1) % args.gradient_accumulation_steps == 0)
@@ -2022,13 +2108,16 @@ def main(args):
 
         # ========== 每10个epoch保存模型 ==========
         if rank == 0 and (epoch + 1) % 10 == 0:
-            checkpoint = {
-                "model": get_raw_model(model).state_dict(),
-                "ema": ema.state_dict(),
-                "train_steps": train_steps,
-                "epoch": epoch + 1,
-                "best_val_metric": best_val_metric
-            }
+            checkpoint = build_training_checkpoint(
+                model=model,
+                ema=ema,
+                train_steps=train_steps,
+                epoch=epoch + 1,
+                best_val_metric=best_val_metric,
+                opt=opt,
+                lr_scheduler=lr_scheduler,
+                scaler=scaler,
+            )
             ckpt_path = f"{checkpoint_dir}/epoch_{epoch+1:03d}.pth"
             torch.save(checkpoint, ckpt_path)
             # 保存后清理
@@ -2039,13 +2128,16 @@ def main(args):
 
         # 保存最新epoch检查点（仅保存model/ema）
         if rank == 0:
-            checkpoint = {
-                "model": get_raw_model(model).state_dict(),
-                "ema": ema.state_dict(),
-                "train_steps": train_steps,
-                "epoch": epoch + 1,
-                "best_val_metric": best_val_metric
-            }
+            checkpoint = build_training_checkpoint(
+                model=model,
+                ema=ema,
+                train_steps=train_steps,
+                epoch=epoch + 1,
+                best_val_metric=best_val_metric,
+                opt=opt,
+                lr_scheduler=lr_scheduler,
+                scaler=scaler,
+            )
             torch.save(checkpoint, f"{checkpoint_dir}/latest_epoch_train_model.pth")
             # 保存后立即清理
             del checkpoint
@@ -2063,7 +2155,8 @@ def main(args):
             vae.eval()
             val_diffusion = create_diffusion(
                 timestep_respacing=timestep_respacing_val,
-                diffusion_steps=args.diffusion_steps
+                diffusion_steps=args.diffusion_steps,
+                learn_sigma=args.learn_sigma,
             )
             
             with torch.no_grad():
@@ -2137,7 +2230,8 @@ def main(args):
             vae.eval()
             val_diffusion = create_diffusion(
                 timestep_respacing=timestep_respacing_val,
-                diffusion_steps=args.diffusion_steps
+                diffusion_steps=args.diffusion_steps,
+                learn_sigma=args.learn_sigma,
             )
 
             stage_meta = get_stage_metadata(train_steps, args)
@@ -2270,6 +2364,19 @@ def main(args):
                         f"新最优指标: {val_metric:.4f} (之前: {prev_best:.4f}) | "
                         f"提升: {prev_best - val_metric:.4f}"
                     )
+
+                latest_checkpoint = build_training_checkpoint(
+                    model=model,
+                    ema=ema,
+                    train_steps=train_steps,
+                    epoch=epoch + 1,
+                    best_val_metric=best_val_metric,
+                    opt=opt,
+                    lr_scheduler=lr_scheduler,
+                    scaler=scaler,
+                )
+                torch.save(latest_checkpoint, f"{checkpoint_dir}/latest_epoch_train_model.pth")
+                del latest_checkpoint
 
             model.train()
             torch.cuda.empty_cache()
