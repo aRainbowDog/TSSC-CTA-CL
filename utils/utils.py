@@ -208,6 +208,39 @@ def create_logger(logging_dir, level="INFO", console=None, use_rich=True):
     return logger
 
 
+def _run_git_command(args, cwd=None):
+    try:
+        result = subprocess.run(
+            args,
+            cwd=cwd or os.getcwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return result.stdout.strip() or None
+
+
+def collect_git_metadata(cwd=None):
+    """Best-effort git metadata for experiment tracking."""
+    cwd = cwd or os.getcwd()
+    branch = _run_git_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd)
+    commit = _run_git_command(["git", "rev-parse", "HEAD"], cwd=cwd)
+    commit_short = _run_git_command(["git", "rev-parse", "--short", "HEAD"], cwd=cwd)
+    status = _run_git_command(["git", "status", "--short"], cwd=cwd)
+    if branch is None and commit is None:
+        return None
+    return {
+        "branch": branch,
+        "commit": commit,
+        "commit_short": commit_short,
+        "is_dirty": bool(status),
+        "status_short": status or "",
+    }
+
+
 def create_experiment_tracker(
         backend,
         logging_dir,
@@ -228,15 +261,43 @@ def create_experiment_tracker(
         if wandb is None:
             raise ImportError("wandb is not installed. Please install wandb to use this tracking backend.")
         os.makedirs(logging_dir, exist_ok=True)
-        return wandb.init(
+        git_metadata = collect_git_metadata()
+        tracker_config = dict(config) if isinstance(config, dict) else config
+        notes = None
+        tags = None
+        if git_metadata is not None:
+            if tracker_config is None:
+                tracker_config = {}
+            if isinstance(tracker_config, dict):
+                tracker_config = dict(tracker_config)
+                tracker_config["git"] = git_metadata
+            dirty_label = "dirty" if git_metadata["is_dirty"] else "clean"
+            notes = (
+                f"git branch: {git_metadata['branch'] or '-'} | "
+                f"commit: {git_metadata['commit_short'] or git_metadata['commit'] or '-'} | "
+                f"state: {dirty_label}"
+            )
+            tags = [f"git:{dirty_label}"]
+            if git_metadata["branch"]:
+                tags.append(f"branch:{git_metadata['branch']}")
+
+        run = wandb.init(
             project=project or "TSSC-CTA-CL",
             entity=entity,
             mode=mode,
             dir=logging_dir,
             name=run_name,
-            config=config,
+            config=tracker_config,
+            notes=notes,
+            tags=tags,
             reinit="return_previous",
         )
+        if git_metadata is not None:
+            run.summary["git/branch"] = git_metadata["branch"] or ""
+            run.summary["git/commit"] = git_metadata["commit"] or ""
+            run.summary["git/commit_short"] = git_metadata["commit_short"] or ""
+            run.summary["git/is_dirty"] = git_metadata["is_dirty"]
+        return run
 
     raise ValueError(f"Unsupported tracking backend: {backend}")
 
