@@ -69,22 +69,22 @@ curriculum_learning:
   # ========== 阶段0：新增Gap=1（伪GT） ==========
   stage0_steps: 0 # 500
   stage0_frame_gap: 1
-  stage0_dense_frames: 2  # 只需要2帧
+  stage0_dense_frames: 2
   stage0_use_pseudo_gt: true
   stage0_alpha_range: [0.3, 0.7]  # α随机范围
   
   # ========== 阶段1：修正Gap=2 ==========
   stage1_steps: 8001 # 1500
-  stage1_frame_gap: 2  # 修正：之前错误地写成1
+  stage1_frame_gap: 2
   stage1_dense_frames: 3
   
   # ========== 阶段2：修正Gap=4 ==========
   stage2_steps: 16000 # 2500
-  stage2_frame_gap: 4  # 修正：之前写成2
+  stage2_frame_gap: 4
   stage2_dense_frames: 5
   
   # ========== 阶段3：修正Gap=8 ==========
-  stage3_frame_gap: 8  # 修正：之前写成4
+  stage3_frame_gap: 8
   stage3_dense_frames: 9
   
   # 递归链配置

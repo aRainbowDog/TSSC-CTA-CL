@@ -1473,7 +1473,7 @@ def main(args):
 
     # 打印配置
     if rank == 0:
-        logger.info(f"\n{'='*60}")
+        logger.info(f"{'='*60}")
         logger.info(f"📚 四阶段课程学习配置:")
         logger.info(f"  阶段0: 0→{stage0_steps} steps, Gap=1, 2帧, 伪GT+随机α")
         logger.info(f"  阶段1: {stage0_steps}→{stage1_steps} steps, Gap=2, 3帧")
@@ -1483,7 +1483,7 @@ def main(args):
         logger.info(f"  血管mask: {'启用' if vessel_mask_enable else '禁用'}")
         logger.info(f"  三元组loss模式: {triplet_loss_mode}")
         logger.info("  验证口径: 滑窗三连帧代理评测（首尾帧预测中间帧）")
-        logger.info(f"{'='*60}\n")
+        logger.info(f"{'='*60}")
 
     # 存储到args
     args.stage0_steps = stage0_steps
