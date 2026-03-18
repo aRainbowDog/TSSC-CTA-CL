@@ -14,7 +14,6 @@ from rich.logging import RichHandler
 from torch import inf
 from PIL import Image
 from typing import Union, Iterable
-from collections import OrderedDict
 from torch.utils.tensorboard import SummaryWriter
 
 try:
@@ -414,12 +413,25 @@ def update_ema(ema_model, model, decay=0.9999):
     """
     Step the EMA model towards the current model.
     """
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
+    ema_state = ema_model.state_dict()
+    model_state = model.state_dict()
 
-    for name, param in model_params.items():
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+    if ema_state.keys() != model_state.keys():
+        missing_in_ema = sorted(set(model_state.keys()) - set(ema_state.keys()))
+        missing_in_model = sorted(set(ema_state.keys()) - set(model_state.keys()))
+        raise ValueError(
+            "EMA/model state_dict keys do not match. "
+            f"Missing in EMA: {missing_in_ema[:5]} | Missing in model: {missing_in_model[:5]}"
+        )
+
+    for name, value in model_state.items():
+        target = ema_state[name]
+        if not isinstance(value, torch.Tensor):
+            continue
+        if torch.is_floating_point(value):
+            target.mul_(decay).add_(value.data, alpha=1 - decay)
+        else:
+            target.copy_(value)
 
 
 def requires_grad(model, flag=True):

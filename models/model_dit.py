@@ -25,6 +25,10 @@ def modulate(x, shift, scale, T):
 
     N, M = x.shape[-2], x.shape[-1]
     B = scale.shape[0]
+    if x.shape[0] != B * T:
+        raise ValueError(
+            f"Expected {(B * T)} tokens for modulation with batch={B}, frames={T}, got {x.shape[0]}"
+        )
     x = rearrange(x, '(b t) n m-> b (t n) m',b=B,t=T,n=N,m=M)
     x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
     x = rearrange(x, 'b (t n) m-> (b t) n m',b=B,t=T,n=N,m=M)
@@ -105,6 +109,18 @@ class TimestepEmbedder(nn.Module):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
+
+
+class FrameTimeEmbedder(TimestepEmbedder):
+    """Embeds continuous frame timestamps with the same sinusoidal+MLP recipe."""
+
+    def forward(self, frame_times):
+        if frame_times.ndim == 2:
+            bsz, num_frames = frame_times.shape
+            frame_times = frame_times.reshape(-1)
+            embeddings = super().forward(frame_times)
+            return embeddings.reshape(bsz, num_frames, -1)
+        return super().forward(frame_times)
 
 
 class LabelEmbedder(nn.Module):
@@ -191,9 +207,11 @@ class MVIFBlock(nn.Module):
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        T = self.num_frames
+        B = c.shape[0]
         K, N, M = x.shape
-        B = K // T
+        if B <= 0 or K % B != 0:
+            raise ValueError(f"Invalid token shape {tuple(x.shape)} for conditioning batch size {B}")
+        T = K // B
         if self.mode == 'video':
             x = rearrange(x, '(b t) n m -> (b n) t m',b=B,t=T,n=N,m=M)
             res_temporal = self.temporal_attn(self.temporal_norm1(x))
@@ -202,13 +220,13 @@ class MVIFBlock(nn.Module):
             x = rearrange(x, '(b n) t m -> (b t) n m',b=B,t=T,n=N,m=M)
             x = x + res_temporal
 
-        attn = self.attn(modulate(self.norm1(x), shift_msa, scale_msa, self.num_frames))
+        attn = self.attn(modulate(self.norm1(x), shift_msa, scale_msa, T))
         attn = rearrange(attn, '(b t) n m-> b (t n) m',b=B,t=T,n=N,m=M)
         attn = gate_msa.unsqueeze(1) * attn
         attn = rearrange(attn, 'b (t n) m-> (b t) n m',b=B,t=T,n=N,m=M)
         x = x + attn
 
-        mlp = self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp, self.num_frames))
+        mlp = self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp, T))
         mlp = rearrange(mlp, '(b t) n m-> b (t n) m',b=B,t=T,n=N,m=M)
         mlp = gate_mlp.unsqueeze(1) * mlp
         mlp = rearrange(mlp, 'b (t n) m-> (b t) n m',b=B,t=T,n=N,m=M)
@@ -242,7 +260,11 @@ class FinalLayer(nn.Module):
 
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale, self.num_frames)
+        B = c.shape[0]
+        if B <= 0 or x.shape[0] % B != 0:
+            raise ValueError(f"Invalid final-layer token shape {tuple(x.shape)} for conditioning batch size {B}")
+        T = x.shape[0] // B
+        x = modulate(self.norm_final(x), shift, scale, T)
         x = self.linear(x)
         return x
 
@@ -285,6 +307,7 @@ class MVIF(nn.Module):
         if self.mode == 'video':
             self.num_frames = num_frames
             self.time_embed = nn.Parameter(torch.zeros(1, num_frames, hidden_size), requires_grad=False)
+            self.frame_time_embedder = FrameTimeEmbedder(hidden_size)
             self.time_drop = nn.Dropout(p=0)
         else:
             self.num_frames = 1
@@ -330,6 +353,9 @@ class MVIF(nn.Module):
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        if self.mode == 'video':
+            nn.init.normal_(self.frame_time_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.frame_time_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in MVIF blocks:
         for block in self.blocks:
@@ -357,7 +383,14 @@ class MVIF(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t):
+    def _get_slot_time_embed(self, num_frames, device):
+        if num_frames == self.time_embed.shape[1]:
+            return self.time_embed
+        grid_num_frames = np.arange(num_frames, dtype=np.float32)
+        time_embed = get_1d_sincos_pos_embed_from_grid(self.pos_embed.shape[-1], grid_num_frames)
+        return torch.from_numpy(time_embed).float().unsqueeze(0).to(device)
+
+    def forward(self, x, t, frame_times=None):
         """
         Forward pass of MVIF.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -372,8 +405,15 @@ class MVIF(nn.Module):
         if self.mode == 'video':
             # Temporal embed
             x = rearrange(x, '(b t) n m -> (b n) t m',b=B,t=T)
-            ## Resizing time embeddings in case they don't match
-            x = x + self.time_embed
+            if frame_times is not None:
+                if frame_times.shape != (B, T):
+                    raise ValueError(f"frame_times shape must be {(B, T)}, got {tuple(frame_times.shape)}")
+                temporal_embed = self.frame_time_embedder(frame_times.to(x.device))
+            else:
+                temporal_embed = self._get_slot_time_embed(T, x.device).expand(B, -1, -1)
+            temporal_embed = temporal_embed.unsqueeze(1).expand(B, x.shape[0] // B, T, x.shape[-1])
+            temporal_embed = rearrange(temporal_embed, 'b n t m -> (b n) t m')
+            x = x + temporal_embed
             x = self.time_drop(x)
             x = rearrange(x, '(b n) t m -> (b t) n m',b=B,t=T)
         
@@ -400,7 +440,7 @@ class MVIF(nn.Module):
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        model_out = self.forward(combined, t)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.

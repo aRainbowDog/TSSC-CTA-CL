@@ -1,39 +1,18 @@
 # autodl
 import warnings
 import os
-import gc
 import json
 import math
-import argparse
 import logging
-from contextlib import nullcontext
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
-from torchvision.utils import save_image
-from glob import glob
 from time import time
 from copy import deepcopy
 from einops import rearrange
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from models.model_dit import MVIF_models
-from models.diffusion.gaussian_diffusion import (
-    create_diffusion,
-    LossType,
-    ModelMeanType,
-    ModelVarType,
-)
+from models.diffusion.gaussian_diffusion import create_diffusion
 from dataloader.data_loader_acdc import (
     build_train_val_split_manifest,
     collate_full_sequence_batch,
@@ -41,22 +20,45 @@ from dataloader.data_loader_acdc import (
     full_sequence_data_loader,
 )
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 from diffusers.models import AutoencoderKL
 from diffusers.optimization import get_scheduler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from training.checkpointing import (
+    build_training_checkpoint,
+    get_ema_decay,
+    move_optimizer_state_to_device,
+    resolve_experiment_dir,
+    safe_load_checkpoint,
+)
+from training.common import (
+    create_logger_compat,
+    create_rich_progress,
+    distributed_barrier,
+    maybe_cleanup_cuda,
+)
+from training.losses_triplet import (
+    backward_recursive_triplets,
+    build_stage2_recursive_triplets,
+    build_stage3_recursive_triplets,
+    compute_triplet_loss,
+)
+from training.runtime import ddp_sync_context, get_raw_model, set_optimizer_zeros_grad
+from training.validation_triplet import (
+    DistributedEvalSampler,
+    format_epoch_progress_status,
+    format_overall_progress_status,
+    get_fixed_visualization_indices,
+    save_val_sample_visualization,
+)
+from training.vessel_mask import generate_vessel_mask_adaptive, prepare_mask_for_latent
 from utils.triplet_eval import evaluate_video_sliding_triplets
 from utils.utils import (
-    clip_grad_norm_, create_logger, update_ema, requires_grad, 
+    clip_grad_norm_, update_ema, requires_grad, 
     cleanup, create_experiment_tracker, write_experiment_metric,
     write_experiment_artifact, write_experiment_images, close_experiment_tracker, setup_distributed
 )
-# ========== 新增mask生成相关依赖 ==========
-import cv2
-import matplotlib.pyplot as plt
-from pathlib import Path
-from skimage.filters import apply_hysteresis_threshold
 warnings.filterwarnings('ignore')
 
 
@@ -65,1262 +67,6 @@ def log_debug(logger, *lines):
         return
     for line in lines:
         logger.debug(line)
-
-
-def create_logger_compat(logging_dir, level="INFO", console=None):
-    """Support both old and new create_logger signatures."""
-    try:
-        return create_logger(logging_dir, level=level, console=console)
-    except TypeError:
-        logger = create_logger(logging_dir)
-        resolved_level = getattr(logging, str(level).upper(), logging.INFO)
-        logger.setLevel(resolved_level)
-        for handler in logger.handlers:
-            handler.setLevel(resolved_level)
-        return logger
-
-
-def distributed_barrier():
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        dist.barrier()
-
-
-def create_rich_progress(console=None):
-    return Progress(
-        SpinnerColumn(style="bold blue"),
-        TextColumn("[bold cyan]{task.description}"),
-        BarColumn(bar_width=28),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TextColumn("{task.fields[status]}", justify="left"),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console or Console(stderr=True),
-        transient=False,
-        expand=True,
-        refresh_per_second=4,
-    )
-
-
-def maybe_cleanup_cuda(step, interval):
-    if interval is None or interval <= 0 or step <= 0 or step % interval != 0:
-        return
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-
-
-def get_fixed_visualization_indices(dataset_len, count):
-    if dataset_len <= 0 or count <= 0:
-        return []
-    if count >= dataset_len:
-        return list(range(dataset_len))
-    return sorted({int(idx) for idx in np.linspace(0, dataset_len - 1, num=count)})
-
-
-def get_visualization_stage_info(current_step, stage0_steps, stage1_steps, stage2_steps):
-    """Return visualization stage id/name for the current training step."""
-    if current_step < stage0_steps:
-        return 0, "Stage0_Gap1"
-    if current_step < stage1_steps:
-        return 1, "Stage1_Gap2"
-    if current_step < stage2_steps:
-        return 2, "Stage2_Gap4"
-    return 3, "Stage3_Gap8"
-
-
-class DistributedEvalSampler(Sampler):
-    """Shard validation samples across ranks without padding or duplication."""
-
-    def __init__(self, dataset, num_replicas=None, rank=None):
-        if num_replicas is None:
-            num_replicas = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-        if rank is None:
-            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-        self.dataset = dataset
-        self.num_replicas = num_replicas
-        self.rank = rank
-
-    def __iter__(self):
-        return iter(range(self.rank, len(self.dataset), self.num_replicas))
-
-    def __len__(self):
-        remaining = len(self.dataset) - self.rank
-        if remaining <= 0:
-            return 0
-        return (remaining + self.num_replicas - 1) // self.num_replicas
-
-
-def get_stage_metadata(train_steps, args):
-    if train_steps < args.stage0_steps:
-        return {"stage": 0, "gap": 1, "frames": 2, "next": f"s1@{args.stage0_steps}"}
-    if train_steps < args.stage1_steps:
-        return {"stage": 1, "gap": 2, "frames": 3, "next": f"s2@{args.stage1_steps}"}
-    if train_steps < args.stage2_steps:
-        return {"stage": 2, "gap": 4, "frames": 5, "next": f"s3@{args.stage2_steps}"}
-    return {"stage": 3, "gap": 8, "frames": 9, "next": "done"}
-
-
-def format_overall_progress_status(epoch, num_train_epochs, train_steps, args):
-    meta = get_stage_metadata(train_steps, args)
-    return (
-        f"epoch {epoch + 1}/{num_train_epochs} | "
-        f"opt {train_steps}/{args.max_train_steps} | "
-        f"s{meta['stage']} g{meta['gap']} f{meta['frames']} | "
-        f"next {meta['next']}"
-    )
-
-
-def format_epoch_progress_status(
-        batch_step,
-        total_batches,
-        train_steps,
-        max_train_steps,
-        stage=None,
-        frame_gap=None,
-        num_frames=None,
-        loss_value=None,
-        recursive_loss_value=None,
-        grad_norm=None):
-    status = [
-        f"batch {batch_step}/{total_batches}",
-        f"opt {train_steps}/{max_train_steps}",
-    ]
-    if stage is not None and frame_gap is not None and num_frames is not None:
-        status.append(f"s{stage} g{frame_gap} f{num_frames}")
-    if loss_value is not None:
-        status.append(f"loss {loss_value:.4f}")
-    if recursive_loss_value is not None:
-        status.append(f"rec {recursive_loss_value:.4f}")
-    if grad_norm is not None:
-        status.append(f"gn {grad_norm:.4f}")
-    return " | ".join(status)
-
-def _extract_into_tensor(arr, timesteps, broadcast_shape):
-    """
-    从1D numpy数组中提取值，用于batch处理
-    Args:
-        arr: 1D numpy array
-        timesteps: [B] tensor of timestep indices
-        broadcast_shape: 目标形状
-    Returns:
-        extracted values with correct shape
-    """
-    if isinstance(arr, np.ndarray):
-        arr = torch.from_numpy(arr).to(device=timesteps.device, dtype=torch.float32)
-    
-    res = arr[timesteps]
-    while len(res.shape) < len(broadcast_shape):
-        res = res[..., None]
-    
-    return res.expand(broadcast_shape)
-# -------------------------- 新增：Mask生成函数 --------------------------
-def generate_vessel_mask_adaptive(frames_gray, max_weight=100.0, base_weight=1.0):
-    """
-    生成自适应血管mask和软权重
-    Args:
-        frames_gray: list of numpy array, 灰度帧列表 [f, h, w]
-        max_weight: float, 血管区域最大权重（最高100倍）
-        base_weight: float, 非血管区域基础权重
-    Returns:
-        mask_final: numpy array, 二值mask [h, w]
-        soft_weight: numpy array, 软权重图 [h, w]（值范围[base_weight, max_weight]）
-    """
-    first_frame = frames_gray[0].astype(np.float32)
-    last_frame = frames_gray[-1].astype(np.float32)
-    
-    # 计算帧差
-    diff_map = np.abs(first_frame - last_frame)
-    diff_smooth = cv2.GaussianBlur(diff_map, (3, 3), 0)
-    
-    # 归一化+增强对比度
-    diff_norm = (diff_smooth / (diff_smooth.max() + 1e-5) * 255).astype(np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    diff_enhanced = clahe.apply(diff_norm)
-    
-    # 自适应阈值
-    flat_data = diff_enhanced.flatten()
-    dynamic_high = np.percentile(flat_data, 97.5) 
-    dynamic_low = np.percentile(flat_data, 96)  
-    dynamic_high = max(dynamic_high, 70) 
-    dynamic_low = max(dynamic_low, 40)
-
-    # 滞后阈值分割
-    mask_binary = apply_hysteresis_threshold(
-        diff_enhanced, dynamic_low, dynamic_high
-    ).astype(np.uint8) * 255
-    
-    # 形态学操作优化mask
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask_refined = cv2.morphologyEx(mask_binary, cv2.MORPH_OPEN, kernel_open)
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask_connected = cv2.morphologyEx(mask_refined, cv2.MORPH_CLOSE, kernel_close)
-    
-    # 筛选有效轮廓
-    cnts, _ = cv2.findContours(mask_connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    mask_final = np.zeros_like(mask_connected)
-    h, w = mask_final.shape
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if 20 < area < (h * w * 0.2):  # 过滤过小/过大轮廓
-            cv2.drawContours(mask_final, [c], -1, 255, -1)
-    
-    # 生成软权重（调整到max_weight范围）
-    if np.any(mask_final > 0):
-        dist = cv2.distanceTransform(mask_final, cv2.DIST_L2, 5)
-        # 权重计算：距离越近权重越高，最大值max_weight，最小值base_weight
-        soft_weight = np.exp(-dist / 8.0) * (max_weight - base_weight) + base_weight
-        # 确保权重不超过最大值
-        soft_weight = np.clip(soft_weight, base_weight, max_weight)
-    else:
-        soft_weight = np.ones_like(diff_map, dtype=np.float32) * base_weight
-    
-    return mask_final, soft_weight
-
-def prepare_mask_for_latent(soft_weight_np, latent_size, device):
-    """
-    将256×256的软权重图转换为latent空间的权重tensor
-    Args:
-        soft_weight_np: numpy array [h, w] (256×256)
-        latent_size: int, latent空间尺寸（32）
-        device: torch.device
-    Returns:
-        weight_latent: torch.Tensor [1, 1, latent_size, latent_size]
-    """
-    # 转换为tensor并调整维度
-    weight_tensor = torch.from_numpy(soft_weight_np).float().to(device)  # [256, 256]
-    weight_tensor = weight_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, 256, 256]
-    
-    # 下采样到latent尺寸（使用双线性插值，保留权重分布）
-    weight_latent = F.interpolate(
-        weight_tensor, 
-        size=(latent_size, latent_size), 
-        mode='bilinear', 
-        align_corners=False
-    )  # [1, 1, 32, 32]
-    
-    return weight_latent
-
-# -------------------------- 全局工具函数（不变） --------------------------
-def get_raw_model(model):
-    """获取DDP包装后的原始模型，若无DDP则返回原模型"""
-    return model.module if hasattr(model, 'module') else model
-
-
-def ddp_sync_context(model, should_sync):
-    if isinstance(model, DDP) and not should_sync:
-        return model.no_sync()
-    return nullcontext()
-
-# ========== 新增：课程学习辅助函数 ==========
-def get_visible_frames(total_frames, interval):
-    """
-    根据间隔返回可见帧的索引
-    Args:
-        total_frames: 总帧数（例如9）
-        interval: 采样间隔（1, 2, 或 4）
-    Returns:
-        可见帧索引列表（例如interval=2时返回[0,2,4,6,8]）
-    """
-    visible_idx = list(range(0, total_frames, interval))
-    return visible_idx
-
-def compute_recursive_loss_stage2(model, diffusion, latent, t, f, b, h_latent, w_latent, device):
-    """
-    阶段2的递归链Loss: 用间隔2补全间隔1
-    ✅ 方案3：手动计算loss（完全绕过training_losses）
-    Args:
-        model: 模型
-        diffusion: 扩散模型对象
-        latent: 潜在编码 [B, F, C, H, W]
-        t: 时间步 [B]
-        f: 帧数
-        其他: 维度信息
-    Returns:
-        递归链loss (tensor)
-    """
-    recursive_losses = []
-    pairs = [(0, 2, 1), (2, 4, 3), (4, 6, 5), (6, 8, 7)]
-    
-    for left_idx, right_idx, mid_idx in pairs:
-        if mid_idx < f:
-            # ========== 步骤1：提取三元组 ==========
-            triplet = torch.stack([
-                latent[:, left_idx],   # [B, C, H, W]
-                latent[:, mid_idx],    # [B, C, H, W] - 目标帧
-                latent[:, right_idx]   # [B, C, H, W]
-            ], dim=1)  # [B, 3, C, H, W]
-            
-            x_start = triplet.permute(0, 2, 1, 3, 4)  # [B, C, 3, H, W]
-            
-            # ========== 步骤2：生成噪声 ==========
-            noise = torch.randn_like(x_start)
-            
-            # ========== 步骤3：提取扩散系数 ==========
-            sqrt_alphas_cumprod = _extract_into_tensor(
-                diffusion.sqrt_alphas_cumprod, t, x_start.shape
-            )
-            sqrt_one_minus_alphas_cumprod = _extract_into_tensor(
-                diffusion.sqrt_one_minus_alphas_cumprod, t, x_start.shape
-            )
-            
-            # ========== 步骤4：加噪 q(x_t | x_0) ==========
-            x_t = sqrt_alphas_cumprod * x_start + sqrt_one_minus_alphas_cumprod * noise
-            
-            # ========== 步骤5：构建mask（left和right可见，middle需要预测）==========
-            # 转换回 [B, 3, C, H, W] 方便mask操作
-            x_t_frames = x_t.permute(0, 2, 1, 3, 4)      # [B, 3, C, H, W]
-            x_start_frames = x_start.permute(0, 2, 1, 3, 4)  # [B, 3, C, H, W]
-            
-            # mask: [B, 3, 1, H, W]，1表示需要预测（mask掉），0表示可见
-            mask = torch.ones(b, 3, 1, h_latent, w_latent, device=device)
-            mask[:, 0] = 0  # left可见
-            mask[:, 2] = 0  # right可见
-            # middle (idx=1) 保持为1（需要预测）
-            
-            # ========== 步骤6：融合可见帧和noisy帧 ==========
-            model_input = x_start_frames * (1 - mask) + x_t_frames * mask  # [B, 3, C, H, W]
-            
-            # ========== 步骤7：模型预测噪声 ==========
-            model_output = model(model_input, t)  # [B, 3, C, H, W]
-            
-            # ========== 步骤8：只计算中间帧的loss ==========
-            # 提取中间帧的预测和目标
-            pred_noise_middle = model_output[:, 1, :, :, :]  # [B, C, H, W]
-            target_noise_middle = noise.permute(0, 2, 1, 3, 4)[:, 1, :, :, :]  # [B, C, H, W]
-            
-            # MSE loss
-            loss_middle = F.mse_loss(pred_noise_middle, target_noise_middle, reduction='mean')
-            recursive_losses.append(loss_middle)
-    
-    if recursive_losses:
-        return torch.stack(recursive_losses).mean()
-    else:
-        return torch.tensor(0.0, device=device)
-
-def compute_recursive_loss_stage3(model, diffusion, latent, t, f, b, h_latent, w_latent, device):
-    """
-    阶段3的多层递归链Loss: 间隔4 → 间隔2 → 间隔1
-    ✅ 方案3：手动计算loss
-    """
-    all_losses = []
-    
-    # ========== 辅助函数：计算单个三元组的loss ==========
-    def compute_single_triplet_loss(left_idx, mid_idx, right_idx):
-        """计算单个三元组[left, middle, right]的loss"""
-        # 提取三元组
-        triplet = torch.stack([
-            latent[:, left_idx],
-            latent[:, mid_idx],   # 目标帧
-            latent[:, right_idx]
-        ], dim=1)  # [B, 3, C, H, W]
-        
-        x_start = triplet.permute(0, 2, 1, 3, 4)  # [B, C, 3, H, W]
-        noise = torch.randn_like(x_start)
-        
-        # 提取扩散系数
-        sqrt_alphas = _extract_into_tensor(
-            diffusion.sqrt_alphas_cumprod, t, x_start.shape
-        )
-        sqrt_one_minus = _extract_into_tensor(
-            diffusion.sqrt_one_minus_alphas_cumprod, t, x_start.shape
-        )
-        
-        # 加噪
-        x_t = sqrt_alphas * x_start + sqrt_one_minus * noise
-        
-        # 构建mask
-        x_t_frames = x_t.permute(0, 2, 1, 3, 4)
-        x_start_frames = x_start.permute(0, 2, 1, 3, 4)
-        
-        mask = torch.ones(b, 3, 1, h_latent, w_latent, device=device)
-        mask[:, 0] = 0  # left可见
-        mask[:, 2] = 0  # right可见
-        
-        # 融合
-        model_input = x_start_frames * (1 - mask) + x_t_frames * mask
-        
-        # 模型预测
-        model_output = model(model_input, t)
-        
-        # 计算中间帧loss
-        pred_middle = model_output[:, 1, :, :, :]
-        target_middle = noise.permute(0, 2, 1, 3, 4)[:, 1, :, :, :]
-        
-        return F.mse_loss(pred_middle, target_middle, reduction='mean')
-    
-    # ========== 第一层递归：用帧0,8预测帧4 ==========
-    if f > 4:
-        layer1_loss = compute_single_triplet_loss(0, 4, 8)
-        all_losses.append(layer1_loss)
-    
-    # ========== 第二层递归：用间隔2补全到间隔1 ==========
-    layer2_pairs = [(0, 2, 4), (4, 6, 8)]
-    for left_idx, mid_idx, right_idx in layer2_pairs:
-        if mid_idx < f:
-            loss = compute_single_triplet_loss(left_idx, mid_idx, right_idx)
-            all_losses.append(loss)
-    
-    # ========== 第三层递归：用间隔1补全所有奇数帧 ==========
-    layer3_pairs = [(0, 1, 2), (2, 3, 4), (4, 5, 6), (6, 7, 8)]
-    for left_idx, mid_idx, right_idx in layer3_pairs:
-        if mid_idx < f:
-            loss = compute_single_triplet_loss(left_idx, mid_idx, right_idx)
-            all_losses.append(loss)
-    
-    if all_losses:
-        return torch.stack(all_losses).mean()
-    else:
-        return torch.tensor(0.0, device=device)
-
-def set_optimizer_zeros_grad(optimizer, set_to_none=True):
-    """安全的optimizer梯度清零，减少显存碎片"""
-    if set_to_none:
-        optimizer.zero_grad(set_to_none=True)
-    else:
-        optimizer.zero_grad()
-
-def safe_load_checkpoint(ckpt_path, device):
-    """
-    加载训练checkpoint到CPU，后续按需恢复到目标device。
-    """
-    del device
-    return torch.load(ckpt_path, map_location="cpu")
-
-
-def move_optimizer_state_to_device(optimizer, device):
-    """Ensure optimizer state tensors live on the same device as model params after resume."""
-    for state in optimizer.state.values():
-        for key, value in state.items():
-            if isinstance(value, torch.Tensor):
-                state[key] = value.to(device, non_blocking=True)
-
-
-def build_training_checkpoint(
-    model,
-    ema,
-    train_steps,
-    epoch,
-    best_val_metric,
-    opt=None,
-    lr_scheduler=None,
-    scaler=None,
-):
-    checkpoint = {
-        "model": get_raw_model(model).state_dict(),
-        "ema": ema.state_dict(),
-        "train_steps": train_steps,
-        "epoch": epoch,
-        "best_val_metric": best_val_metric,
-    }
-    if opt is not None:
-        checkpoint["opt"] = opt.state_dict()
-    if lr_scheduler is not None:
-        checkpoint["lr_scheduler"] = lr_scheduler.state_dict()
-    if scaler is not None:
-        checkpoint["scaler"] = scaler.state_dict()
-    return checkpoint
-
-
-def align_weight_batch(weight_batch, batch_size, num_channels, height, width):
-    """Accept [B,1,H,W] or [B,C,H,W] weights and expand to [B,C,H,W] for loss weighting."""
-    if weight_batch is None:
-        return None
-    if weight_batch.dim() == 3:
-        weight_batch = weight_batch.unsqueeze(1)
-    if weight_batch.dim() != 4:
-        raise ValueError(f"weight_batch must be 3D or 4D, got shape {tuple(weight_batch.shape)}")
-    if weight_batch.shape[0] != batch_size or weight_batch.shape[-2:] != (height, width):
-        raise ValueError(
-            f"weight_batch shape {tuple(weight_batch.shape)} is incompatible with target "
-            f"({batch_size}, {num_channels}, {height}, {width})"
-        )
-    if weight_batch.shape[1] == 1:
-        return weight_batch.expand(-1, num_channels, -1, -1)
-    if weight_batch.shape[1] != num_channels:
-        raise ValueError(
-            f"weight_batch channel dim must be 1 or {num_channels}, got {weight_batch.shape[1]}"
-        )
-    return weight_batch
-
-# 新增：EMA decay调度函数（关键优化）
-def get_ema_decay(train_steps, base_decay=0.9999, min_decay=0.99, warmup_steps=1000):
-    """
-    动态调整EMA decay值：
-    - 热身阶段线性增加decay，避免初始阶段EMA更新过快
-    - 训练后期使用高decay，稳定EMA权重
-    """
-    if train_steps < warmup_steps:
-        decay = min_decay + (base_decay - min_decay) * (train_steps / warmup_steps)
-    else:
-        decay = base_decay
-    return decay
-
-def save_val_sample_visualization(epoch, video_val, vae, val_diffusion, device, val_fold,
-                                  generate_vessel_mask_adaptive, raw_model,
-                                  current_step, stage0_steps, stage1_steps, stage2_steps,
-                                  sample_ids=None, ema_model=None, logger=None):
-    """
-    (epoch, video_val, vae, val_diffusion, device, val_fold, generate_vessel_mask_adaptive, raw_model, ema_model=None)
-    三元组验证可视化（4行完整版）
-    行1: GT
-    行2: Masked输入
-    行3: 预测结果
-    行4: 血管mask
-    """
-    b_val, f_val, c_val, h_val, w_val = video_val.shape
-
-    stage, stage_name = get_visualization_stage_info(current_step, stage0_steps, stage1_steps, stage2_steps)
-
-    # 确定当前阶段
-    if stage == 0:
-        if logger is not None:
-            logger.warning(f"Epoch {epoch+1}: Stage0，跳过可视化")
-        else:
-            print(f"⚠️  Epoch {epoch+1}: Stage0，跳过可视化")
-        return {}
-    
-    # VAE编码全部密集帧
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
-        video_val_flat = rearrange(video_val, 'b f c h w -> (b f) c h w')
-        latent_val = vae.encode(video_val_flat).latent_dist.sample().mul_(0.18215)
-        latent_val = rearrange(latent_val, '(b f) c h w -> b f c h w', b=b_val)
-    
-    b_val, f_val, c_latent, h_latent_val, w_latent_val = latent_val.shape
-    sample_ids = list(sample_ids) if sample_ids is not None else list(range(b_val))
-    
-    # 生成血管mask可视化
-    video_val_np = video_val.detach().cpu().numpy()
-    video_val_gray = np.mean(video_val_np, axis=2)
-    vessel_mask_batches = []
-    for batch_idx in range(b_val):
-        frames_gray = [video_val_gray[batch_idx, t] for t in range(f_val)]
-        mask_final, _ = generate_vessel_mask_adaptive(frames_gray)
-        vessel_mask_vis = torch.from_numpy(mask_final).float().to(device)
-        vessel_mask_vis = vessel_mask_vis.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        vessel_mask_vis = vessel_mask_vis.repeat(1, f_val, 3, 1, 1)
-        vessel_mask_vis = (vessel_mask_vis / 255.0) * 2 - 1
-        vessel_mask_batches.append(vessel_mask_vis)
-    vessel_mask_vis = torch.cat(vessel_mask_batches, dim=0)
-    
-    # ========== 1. 基础预测（三元组，一步到位） ==========
-    with torch.no_grad():
-        if stage == 1:
-            # 阶段1：三元组 [s, s+1, s+2]，预测s+1
-            triplet_latent = latent_val[:, 0:3, :, :, :]  # [B, 3, C, H, W]
-            triplet_video_gt = video_val[:, 0:3, :, :, :]
-            triplet_vessel_mask = vessel_mask_vis[:, 0:3, :, :, :]
-            frame_indices_original = [0, 1, 2]
-            
-        elif stage == 2:
-            # 阶段2：三元组 [s, s+2, s+4]，预测s+2
-            triplet_latent = torch.stack([
-                latent_val[:, 0],
-                latent_val[:, 2],
-                latent_val[:, 4]
-            ], dim=1)  # [B, 3, C, H, W]
-            triplet_video_gt = torch.stack([
-                video_val[:, 0],
-                video_val[:, 2],
-                video_val[:, 4]
-            ], dim=1)
-            triplet_vessel_mask = torch.stack([
-                vessel_mask_vis[:, 0],
-                vessel_mask_vis[:, 2],
-                vessel_mask_vis[:, 4]
-            ], dim=1)
-            frame_indices_original = [0, 2, 4]
-            
-        else:  # stage == 3
-            # 阶段3：三元组 [s, s+4, s+8]，预测s+4
-            triplet_latent = torch.stack([
-                latent_val[:, 0],
-                latent_val[:, 4],
-                latent_val[:, 8]
-            ], dim=1)
-            triplet_video_gt = torch.stack([
-                video_val[:, 0],
-                video_val[:, 4],
-                video_val[:, 8]
-            ], dim=1)
-            triplet_vessel_mask = torch.stack([
-                vessel_mask_vis[:, 0],
-                vessel_mask_vis[:, 4],
-                vessel_mask_vis[:, 8]
-            ], dim=1)
-            frame_indices_original = [0, 4, 8]
-        
-        # 构建三元组mask（首尾可见，中间预测）
-        mask_base = torch.ones(b_val, 3, h_latent_val, w_latent_val, device=device)
-        mask_base[:, 0, :, :] = 0  # 首帧可见
-        mask_base[:, 2, :, :] = 0  # 尾帧可见
-        
-        # 采样预测
-        z = torch.randn_like(triplet_latent.permute(0, 2, 1, 3, 4))
-        samples_base = val_diffusion.p_sample_loop(
-            raw_model.forward, z.shape, z,
-            clip_denoised=False, progress=False, device=device,
-            raw_x=triplet_latent.permute(0, 2, 1, 3, 4),
-            mask=mask_base
-        )
-        
-        # 解码
-        samples_base = samples_base.permute(1, 0, 2, 3, 4) * mask_base + triplet_latent.permute(2, 0, 1, 3, 4) * (1 - mask_base)
-        samples_base = samples_base.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W]
-        samples_base_flat = rearrange(samples_base, 'b f c h w -> (b f) c h w') / 0.18215
-        decoded_base = vae.decode(samples_base_flat).sample
-        decoded_base = rearrange(decoded_base, '(b f) c h w -> b f c h w', b=b_val)
-        decoded_base_gray = decoded_base.mean(dim=2, keepdim=True)
-        decoded_base = decoded_base_gray.repeat(1, 1, 3, 1, 1)
-        
-        # 构建mask可视化（灰色遮罩）
-        mask_base_vis = torch.ones(b_val, 3, 3, h_val, w_val, device=device) * 0.5
-        mask_base_vis[:, 0, :, :, :] = 0  # 第0帧（首帧）不遮罩
-        mask_base_vis[:, 2, :, :, :] = 0  # 第2帧（尾帧）不遮罩
-        
-        base_images = []
-        for sample_idx, sample_id in enumerate(sample_ids):
-            video_val_single = triplet_video_gt[sample_idx:sample_idx+1]
-            decoded_base_single = decoded_base[sample_idx:sample_idx+1]
-            mask_base_vis_single = mask_base_vis[sample_idx:sample_idx+1]
-            vessel_mask_single = triplet_vessel_mask[sample_idx:sample_idx+1]
-
-            val_pic_base = torch.cat([
-                video_val_single,
-                video_val_single * (1 - mask_base_vis_single),
-                decoded_base_single,
-                vessel_mask_single
-            ], dim=1)
-
-            val_pic_base_flat = rearrange(val_pic_base, 'b f c h w -> (b f) c h w')
-            base_image_path = os.path.join(
-                val_fold,
-                f"Epoch_{epoch+1}_{stage_name}_base_triplet_idx_{sample_id:04d}.png",
-            )
-            save_image(
-                val_pic_base_flat,
-                base_image_path,
-                nrow=3,
-                normalize=True,
-                value_range=(-1, 1)
-            )
-            base_images.append({
-                "path": base_image_path,
-                "caption": f"Epoch {epoch+1} {stage_name} base triplet idx {sample_id}",
-            })
-
-        del z, samples_base, decoded_base
-
-    generated_images = {
-        "Val Examples/BaseTriplet": base_images
-    }
-    
-    # ========== 2. 递归链预测（逐层细化，完整帧序列） ==========
-    if stage >= 2:  # 阶段2和3才有递归链
-        with torch.no_grad():
-            if stage == 2:
-                # 阶段2递归链：5帧完整可视化
-                result_frames = [None] * 5
-                
-                # 第1步：用[s, s+4]预测s+2
-                triplet_step1 = torch.stack([latent_val[:, 0], latent_val[:, 2], latent_val[:, 4]], dim=1)
-                mask_step1 = torch.ones(b_val, 3, h_latent_val, w_latent_val, device=device)
-                mask_step1[:, 0, :, :] = 0
-                mask_step1[:, 2, :, :] = 0
-                
-                z1 = torch.randn_like(triplet_step1.permute(0, 2, 1, 3, 4))
-                samples1 = val_diffusion.p_sample_loop(
-                    raw_model.forward, z1.shape, z1,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_step1.permute(0, 2, 1, 3, 4),
-                    mask=mask_step1
-                )
-                # samples1 = samples1.permute(1, 0, 2, 3, 4)
-                # predicted_s2_latent = samples1[:, 1, :, :, :].clone()
-                # 融合mask + permute回来
-                samples1 = samples1.permute(1, 0, 2, 3, 4) * mask_step1 + \
-                           triplet_step1.permute(2, 0, 1, 3, 4) * (1 - mask_step1)
-                samples1 = samples1.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W] ✅
-                
-                predicted_s2_latent = samples1[:, 1, :, :, :].clone()  # [B, C, H, W] ✅
-                
-                # 解码s+2
-                decoded_s2 = vae.decode(predicted_s2_latent / 0.18215).sample
-                decoded_s2_gray = decoded_s2.mean(dim=1, keepdim=True)
-                result_frames[0] = video_val[:, 0]  # s (GT)
-                result_frames[2] = decoded_s2_gray.repeat(1, 3, 1, 1)  # s+2 (预测)
-                result_frames[4] = video_val[:, 4]  # s+4 (GT)
-                
-                del z1, samples1
-                
-                # 第2步：用[s, pred_s+2]预测s+1
-                triplet_step2 = torch.stack([latent_val[:, 0], latent_val[:, 1], predicted_s2_latent.detach()], dim=1)
-                z2 = torch.randn_like(triplet_step2.permute(0, 2, 1, 3, 4))
-                samples2 = val_diffusion.p_sample_loop(
-                    raw_model.forward, z2.shape, z2,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_step2.permute(0, 2, 1, 3, 4),
-                    mask=mask_step1
-                )
-                # samples2 = samples2.permute(1, 0, 2, 3, 4)
-                # decoded_s1 = vae.decode(samples2[:, 1, :, :, :] / 0.18215).sample
-                samples2 = samples2.permute(1, 0, 2, 3, 4) * mask_step1 + \
-                           triplet_step2.permute(2, 0, 1, 3, 4) * (1 - mask_step1)
-                samples2 = samples2.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W] ✅
-                
-                decoded_s1 = vae.decode(samples2[:, 1, :, :, :] / 0.18215).sample  # ✅
-                decoded_s1_gray = decoded_s1.mean(dim=1, keepdim=True)
-                result_frames[1] = decoded_s1_gray.repeat(1, 3, 1, 1)
-                
-                del z2, samples2
-                
-                # 第3步：用[pred_s+2, s+4]预测s+3
-                triplet_step3 = torch.stack([predicted_s2_latent.detach(), latent_val[:, 3], latent_val[:, 4]], dim=1)
-                z3 = torch.randn_like(triplet_step3.permute(0, 2, 1, 3, 4))
-                samples3 = val_diffusion.p_sample_loop(
-                    raw_model.forward, z3.shape, z3,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_step3.permute(0, 2, 1, 3, 4),
-                    mask=mask_step1
-                )
-                # samples3 = samples3.permute(1, 0, 2, 3, 4)
-                # decoded_s3 = vae.decode(samples3[:, 1, :, :, :] / 0.18215).sample
-                samples3 = samples3.permute(1, 0, 2, 3, 4) * mask_step1 + \
-                           triplet_step3.permute(2, 0, 1, 3, 4) * (1 - mask_step1)
-                samples3 = samples3.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W] ✅
-                
-                decoded_s3 = vae.decode(samples3[:, 1, :, :, :] / 0.18215).sample  # ✅
-                decoded_s3_gray = decoded_s3.mean(dim=1, keepdim=True)
-                result_frames[3] = decoded_s3_gray.repeat(1, 3, 1, 1)
-                
-                del z3, samples3, predicted_s2_latent
-                
-                # 拼接5帧结果
-                result_video = torch.stack(result_frames, dim=1)  # [B, 5, C, H, W]
-                num_frames_rec = 5
-            else:  # stage == 3
-                # ✅ 阶段3递归链：完整版，逐层递归预测9帧
-                # 递归结构：
-                # 第1层：[0, 8] → 4
-                # 第2层：[0, 4] → 2, [4, 8] → 6
-                # 第3层：[0, 2] → 1, [2, 4] → 3, [4, 6] → 5, [6, 8] → 7
-                
-                result_frames = [None] * 9
-                
-                # 预先填充GT帧
-                result_frames[0] = video_val[:, 0]  # frame_0 (GT)
-                result_frames[8] = video_val[:, 8]  # frame_8 (GT)
-                
-                # 通用mask（首尾可见，中间预测）
-                mask_triplet = torch.ones(b_val, 3, h_latent_val, w_latent_val, device=device)
-                mask_triplet[:, 0, :, :] = 0  # 首帧可见
-                mask_triplet[:, 2, :, :] = 0  # 尾帧可见
-                
-                # ========== 第1层：用[0, 8]预测4 ==========
-                triplet_l1 = torch.stack([
-                    latent_val[:, 0],   # frame_0
-                    latent_val[:, 4],   # frame_4（占位，将被预测）
-                    latent_val[:, 8]    # frame_8
-                ], dim=1)  # [B, 3, C, H, W]
-                
-                z_l1 = torch.randn_like(triplet_l1.permute(0, 2, 1, 3, 4))
-                samples_l1 = val_diffusion.p_sample_loop(
-                    raw_model.forward, z_l1.shape, z_l1,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_l1.permute(0, 2, 1, 3, 4),
-                    mask=mask_triplet
-                )
-                
-                # 融合+提取
-                samples_l1 = samples_l1.permute(1, 0, 2, 3, 4) * mask_triplet + \
-                             triplet_l1.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
-                samples_l1 = samples_l1.permute(1, 2, 0, 3, 4)  # [B, 3, C, H, W]
-                pred_4_latent = samples_l1[:, 1, :, :, :].clone()  # [B, C, H, W]
-                
-                # 解码frame_4
-                decoded_4 = vae.decode(pred_4_latent / 0.18215).sample
-                decoded_4_gray = decoded_4.mean(dim=1, keepdim=True)
-                result_frames[4] = decoded_4_gray.repeat(1, 3, 1, 1)
-                
-                del z_l1, samples_l1
-                torch.cuda.empty_cache()
-                # ========== 第2层：用[0, pred_4]预测2，用[pred_4, 8]预测6 ==========
-                # 预测frame_2
-                triplet_l2a = torch.stack([
-                    latent_val[:, 0],
-                    latent_val[:, 2],           # 占位
-                    pred_4_latent.detach()
-                ], dim=1)
-                
-                z_l2a = torch.randn_like(triplet_l2a.permute(0, 2, 1, 3, 4))
-                samples_l2a = val_diffusion.p_sample_loop(
-                    raw_model.forward, z_l2a.shape, z_l2a,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_l2a.permute(0, 2, 1, 3, 4),
-                    mask=mask_triplet
-                )
-                
-                samples_l2a = samples_l2a.permute(1, 0, 2, 3, 4) * mask_triplet + \
-                              triplet_l2a.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
-                samples_l2a = samples_l2a.permute(1, 2, 0, 3, 4)
-                pred_2_latent = samples_l2a[:, 1, :, :, :].clone()
-                
-                decoded_2 = vae.decode(pred_2_latent / 0.18215).sample
-                decoded_2_gray = decoded_2.mean(dim=1, keepdim=True)
-                result_frames[2] = decoded_2_gray.repeat(1, 3, 1, 1)
-                
-                del z_l2a, samples_l2a
-                torch.cuda.empty_cache()
-                # 预测frame_6
-                triplet_l2b = torch.stack([
-                    pred_4_latent.detach(),
-                    latent_val[:, 6],           # 占位
-                    latent_val[:, 8]
-                ], dim=1)
-                
-                z_l2b = torch.randn_like(triplet_l2b.permute(0, 2, 1, 3, 4))
-                samples_l2b = val_diffusion.p_sample_loop(
-                    raw_model.forward, z_l2b.shape, z_l2b,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_l2b.permute(0, 2, 1, 3, 4),
-                    mask=mask_triplet
-                )
-                
-                samples_l2b = samples_l2b.permute(1, 0, 2, 3, 4) * mask_triplet + \
-                              triplet_l2b.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
-                samples_l2b = samples_l2b.permute(1, 2, 0, 3, 4)
-                pred_6_latent = samples_l2b[:, 1, :, :, :].clone()
-                
-                decoded_6 = vae.decode(pred_6_latent / 0.18215).sample
-                decoded_6_gray = decoded_6.mean(dim=1, keepdim=True)
-                result_frames[6] = decoded_6_gray.repeat(1, 3, 1, 1)
-                
-                del z_l2b, samples_l2b
-                torch.cuda.empty_cache()
-                # ========== 第3层：预测1, 3, 5, 7 ==========
-                # 预测frame_1
-                triplet_l3a = torch.stack([
-                    latent_val[:, 0],
-                    latent_val[:, 1],           # 占位
-                    pred_2_latent.detach()
-                ], dim=1)
-                
-                z_l3a = torch.randn_like(triplet_l3a.permute(0, 2, 1, 3, 4))
-                samples_l3a = val_diffusion.p_sample_loop(
-                    raw_model.forward, z_l3a.shape, z_l3a,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_l3a.permute(0, 2, 1, 3, 4),
-                    mask=mask_triplet
-                )
-                
-                samples_l3a = samples_l3a.permute(1, 0, 2, 3, 4) * mask_triplet + \
-                              triplet_l3a.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
-                samples_l3a = samples_l3a.permute(1, 2, 0, 3, 4)
-                decoded_1 = vae.decode(samples_l3a[:, 1, :, :, :] / 0.18215).sample
-                decoded_1_gray = decoded_1.mean(dim=1, keepdim=True)
-                result_frames[1] = decoded_1_gray.repeat(1, 3, 1, 1)
-                
-                del z_l3a, samples_l3a
-                torch.cuda.empty_cache()
-                # 预测frame_3
-                triplet_l3b = torch.stack([
-                    pred_2_latent.detach(),
-                    latent_val[:, 3],           # 占位
-                    pred_4_latent.detach()
-                ], dim=1)
-                
-                z_l3b = torch.randn_like(triplet_l3b.permute(0, 2, 1, 3, 4))
-                samples_l3b = val_diffusion.p_sample_loop(
-                    raw_model.forward, z_l3b.shape, z_l3b,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_l3b.permute(0, 2, 1, 3, 4),
-                    mask=mask_triplet
-                )
-                
-                samples_l3b = samples_l3b.permute(1, 0, 2, 3, 4) * mask_triplet + \
-                              triplet_l3b.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
-                samples_l3b = samples_l3b.permute(1, 2, 0, 3, 4)
-                decoded_3 = vae.decode(samples_l3b[:, 1, :, :, :] / 0.18215).sample
-                decoded_3_gray = decoded_3.mean(dim=1, keepdim=True)
-                result_frames[3] = decoded_3_gray.repeat(1, 3, 1, 1)
-                
-                del z_l3b, samples_l3b
-                torch.cuda.empty_cache()
-                # 预测frame_5
-                triplet_l3c = torch.stack([
-                    pred_4_latent.detach(),
-                    latent_val[:, 5],           # 占位
-                    pred_6_latent.detach()
-                ], dim=1)
-                
-                z_l3c = torch.randn_like(triplet_l3c.permute(0, 2, 1, 3, 4))
-                samples_l3c = val_diffusion.p_sample_loop(
-                    raw_model.forward, z_l3c.shape, z_l3c,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_l3c.permute(0, 2, 1, 3, 4),
-                    mask=mask_triplet
-                )
-                
-                samples_l3c = samples_l3c.permute(1, 0, 2, 3, 4) * mask_triplet + \
-                              triplet_l3c.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
-                samples_l3c = samples_l3c.permute(1, 2, 0, 3, 4)
-                decoded_5 = vae.decode(samples_l3c[:, 1, :, :, :] / 0.18215).sample
-                decoded_5_gray = decoded_5.mean(dim=1, keepdim=True)
-                result_frames[5] = decoded_5_gray.repeat(1, 3, 1, 1)
-                
-                del z_l3c, samples_l3c
-                torch.cuda.empty_cache()
-                # 预测frame_7
-                triplet_l3d = torch.stack([
-                    pred_6_latent.detach(),
-                    latent_val[:, 7],           # 占位
-                    latent_val[:, 8]
-                ], dim=1)
-                
-                z_l3d = torch.randn_like(triplet_l3d.permute(0, 2, 1, 3, 4))
-                samples_l3d = val_diffusion.p_sample_loop(
-                    raw_model.forward, z_l3d.shape, z_l3d,
-                    clip_denoised=False, progress=False, device=device,
-                    raw_x=triplet_l3d.permute(0, 2, 1, 3, 4),
-                    mask=mask_triplet
-                )
-                
-                samples_l3d = samples_l3d.permute(1, 0, 2, 3, 4) * mask_triplet + \
-                              triplet_l3d.permute(2, 0, 1, 3, 4) * (1 - mask_triplet)
-                samples_l3d = samples_l3d.permute(1, 2, 0, 3, 4)
-                decoded_7 = vae.decode(samples_l3d[:, 1, :, :, :] / 0.18215).sample
-                decoded_7_gray = decoded_7.mean(dim=1, keepdim=True)
-                result_frames[7] = decoded_7_gray.repeat(1, 3, 1, 1)
-                
-                del z_l3d, samples_l3d, pred_2_latent, pred_4_latent, pred_6_latent
-                torch.cuda.empty_cache()
-                # 拼接9帧结果
-                result_video = torch.stack(result_frames, dim=1)  # [B, 9, 3, H, W]
-                num_frames_rec = 9
-
-                # # 构建9帧的GT和mask可视化
-                # video_val_rec = video_val[:, :9, :, :, :]
-                # vessel_mask_rec = vessel_mask_vis[:, :9, :, :, :]
-                
-                # mask_rec_vis = torch.ones(b_val, 9, 3, h_val, w_val, device=device) * 0.5  # 灰色
-                # mask_rec_vis[:, 0, :, :, :] = 0   # frame_0不遮罩（GT）
-                # mask_rec_vis[:, 8, :, :, :] = 0   # frame_8不遮罩（GT）
-            # else:  # stage == 3
-            #     # 阶段3递归链：9帧完整可视化（简化版，直接预测）
-            #     mask_rec_all = torch.ones(b_val, f_val, h_latent_val, w_latent_val, device=device)
-            #     mask_rec_all[:, 0, :, :] = 0
-            #     mask_rec_all[:, 8, :, :] = 0
-                
-            #     z_rec = torch.randn_like(latent_val.permute(0, 2, 1, 3, 4))
-            #     samples_rec = val_diffusion.p_sample_loop(
-            #         raw_model.forward, z_rec.shape, z_rec,
-            #         clip_denoised=False, progress=False, device=device,
-            #         raw_x=latent_val.permute(0, 2, 1, 3, 4),
-            #         mask=mask_rec_all
-            #     )
-                
-            #     samples_rec = samples_rec.permute(1, 0, 2, 3, 4) * mask_rec_all + latent_val.permute(2, 0, 1, 3, 4) * (1 - mask_rec_all)
-            #     samples_rec = samples_rec.permute(1, 2, 0, 3, 4)
-            #     samples_rec_flat = rearrange(samples_rec, 'b f c h w -> (b f) c h w') / 0.18215
-            #     decoded_rec = vae.decode(samples_rec_flat).sample
-            #     decoded_rec = rearrange(decoded_rec, '(b f) c h w -> b f c h w', b=b_val)
-            #     decoded_rec_gray = decoded_rec.mean(dim=2, keepdim=True)
-            #     result_video = decoded_rec_gray.repeat(1, 1, 3, 1, 1)
-                
-            #     num_frames_rec = 9
-            #     del z_rec, samples_rec
-            
-            # 构建递归链的mask可视化
-            video_val_rec = video_val[:, :num_frames_rec, :, :, :]
-            vessel_mask_rec = vessel_mask_vis[:, :num_frames_rec, :, :, :]
-            
-            mask_rec_vis = torch.ones(b_val, num_frames_rec, 3, h_val, w_val, device=device) * 0.5  # 灰色
-            mask_rec_vis[:, 0, :, :, :] = 0   # 首帧不遮罩
-            mask_rec_vis[:, -1, :, :, :] = 0  # 尾帧不遮罩
-            
-            recursive_images = []
-            for sample_idx, sample_id in enumerate(sample_ids):
-                result_single = result_video[sample_idx:sample_idx+1]
-                video_val_rec_single = video_val_rec[sample_idx:sample_idx+1]
-                mask_rec_vis_single = mask_rec_vis[sample_idx:sample_idx+1]
-                vessel_mask_rec_single = vessel_mask_rec[sample_idx:sample_idx+1]
-                
-                val_pic_rec = torch.cat([
-                    video_val_rec_single,
-                    video_val_rec_single * (1 - mask_rec_vis_single),
-                    result_single,
-                    vessel_mask_rec_single
-                ], dim=1)
-                
-                val_pic_rec_flat = rearrange(val_pic_rec, 'b f c h w -> (b f) c h w')
-                recursive_image_path = os.path.join(
-                    val_fold,
-                    f"Epoch_{epoch+1}_{stage_name}_recursive_full_idx_{sample_id:04d}.png",
-                )
-                save_image(
-                    val_pic_rec_flat,
-                    recursive_image_path,
-                    nrow=num_frames_rec,
-                    normalize=True,
-                    value_range=(-1, 1)
-                )
-                recursive_images.append({
-                    "path": recursive_image_path,
-                    "caption": f"Epoch {epoch+1} {stage_name} recursive {num_frames_rec} frames idx {sample_id}",
-                })
-            
-            generated_images["Val Examples/Recursive"] = recursive_images
-    
-    torch.cuda.empty_cache()
-    return generated_images
-
-# ========== 三元组loss计算函数 ==========
-def resolve_triplet_loss_pair(
-    diffusion,
-    pred_middle_raw,
-    x_t_middle,
-    x_start_middle,
-    noise_middle,
-    t,
-    loss_target_mode="auto",
-):
-    """Resolve prediction/target tensors for the requested triplet loss mode."""
-    if loss_target_mode == "auto":
-        if diffusion.model_mean_type == ModelMeanType.EPSILON:
-            return pred_middle_raw, noise_middle
-        if diffusion.model_mean_type == ModelMeanType.START_X:
-            return pred_middle_raw, x_start_middle
-        if diffusion.model_mean_type == ModelMeanType.PREVIOUS_X:
-            target_prev, _, _ = diffusion.q_posterior_mean_variance(
-                x_start=x_start_middle,
-                x_t=x_t_middle,
-                t=t,
-            )
-            return pred_middle_raw, target_prev
-        raise NotImplementedError(f"Unsupported model_mean_type: {diffusion.model_mean_type}")
-
-    if loss_target_mode == "epsilon":
-        if diffusion.model_mean_type != ModelMeanType.EPSILON:
-            raise ValueError(
-                "loss_target_mode='epsilon' requires diffusion.model_mean_type == ModelMeanType.EPSILON"
-            )
-        return pred_middle_raw, noise_middle
-
-    if loss_target_mode == "x0":
-        if diffusion.model_mean_type == ModelMeanType.EPSILON:
-            pred_middle = diffusion._predict_xstart_from_eps(
-                x_t=x_t_middle,
-                t=t,
-                eps=pred_middle_raw,
-            )
-        elif diffusion.model_mean_type == ModelMeanType.START_X:
-            pred_middle = pred_middle_raw
-        else:
-            raise NotImplementedError(
-                f"loss_target_mode='x0' is not implemented for {diffusion.model_mean_type}"
-            )
-        return pred_middle, x_start_middle
-
-    raise ValueError(
-        f"Unsupported loss_target_mode: {loss_target_mode}. Expected one of: auto, epsilon, x0"
-    )
-
-
-def compute_triplet_loss(
-    model,
-    diffusion,
-    latent_triplet,
-    t,
-    weight_batch=None,
-    device=None,
-    loss_target_mode="auto",
-):
-    """
-    计算三元组loss（首尾可见，预测中间）。
-
-    loss_target_mode:
-        - auto: follow diffusion.model_mean_type
-        - epsilon: compare predicted noise against noise target
-        - x0: compare predicted x0 against clean latent target
-    """
-    b, f, c, h, w = latent_triplet.shape
-    assert f == 3, f"必须是三元组，当前{f}帧"
-    
-    # 构建mask：首尾可见，中间预测
-    mask = torch.ones(b, f, h, w, device=device)
-    mask[:, 0, :, :] = 0
-    mask[:, 2, :, :] = 0
-    
-    # 使用diffusion的前向过程添加噪声
-    latent_permuted = latent_triplet.permute(0, 2, 1, 3, 4)  # [B, C, 3, H, W]
-    noise = torch.randn_like(latent_permuted)
-    x_t_bcfhw = diffusion.q_sample(latent_permuted, t, noise=noise)  # [B, C, 3, H, W]
-    
-    # 恢复到 [B, 3, C, H, W] 供模型输入
-    x_t = x_t_bcfhw.permute(0, 2, 1, 3, 4)  # [B, 3, C, H, W]
-    
-    # 构建输入：首尾用GT，中间用噪声
-    # mask: [B, 3, H, W]，0表示可见（GT），1表示预测（噪声）
-    model_input = latent_triplet * (1 - mask.unsqueeze(2)) + x_t * mask.unsqueeze(2)
-    
-    # 模型forward
-    model_output = model(model_input, t)  # [B, 3, C_out, H, W]
-    vb_loss = None
-    
-    if diffusion.model_var_type in {ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE}:
-        if model_output.shape[2] != c * 2:
-            raise ValueError(
-                f"Expected model output channels {c * 2} for learned sigma, got {model_output.shape[2]}"
-            )
-        model_output, model_var_values = torch.split(model_output, c, dim=2)
-        frozen_out = torch.cat([model_output.detach(), model_var_values], dim=2).permute(0, 2, 1, 3, 4)
-        vb_loss = diffusion._vb_terms_bpd(
-            model=lambda *args, r=frozen_out: r,
-            x_start=latent_permuted,
-            x_t=x_t_bcfhw,
-            t=t,
-            clip_denoised=False,
-        )["output"].mean()
-        if diffusion.loss_type == LossType.RESCALED_MSE:
-            vb_loss = vb_loss * diffusion.num_timesteps / 1000.0
-    elif model_output.shape[2] != c:
-        raise ValueError(
-            f"Expected model output channels {c} for fixed sigma, got {model_output.shape[2]}"
-        )
-    
-    pred_middle_raw = model_output[:, 1, :, :, :]  # [B, C, H, W]
-    x_t_middle = x_t[:, 1, :, :, :]  # [B, C, H, W]
-    noise_middle = noise.permute(0, 2, 1, 3, 4)[:, 1, :, :, :]  # [B, C, H, W]
-    x_start_middle = latent_triplet[:, 1, :, :, :]  # [B, C, H, W]
-
-    pred_middle, target_middle = resolve_triplet_loss_pair(
-        diffusion=diffusion,
-        pred_middle_raw=pred_middle_raw,
-        x_t_middle=x_t_middle,
-        x_start_middle=x_start_middle,
-        noise_middle=noise_middle,
-        t=t,
-        loss_target_mode=loss_target_mode,
-    )
-    
-    # 计算MSE loss
-    loss_middle = (pred_middle - target_middle) ** 2  # [B, C, H, W]
-    
-    # 血管mask加权
-    if weight_batch is not None:
-        weight_batch = align_weight_batch(weight_batch, b, pred_middle.shape[1], h, w)
-        weight_mean = weight_batch.mean()
-        loss_middle = loss_middle * weight_batch * (1.0 / weight_mean)
-
-    total_loss = loss_middle.mean()
-    if vb_loss is not None:
-        total_loss = total_loss + vb_loss
-
-    return total_loss
-
-# ========== 快速预测中间帧（无梯度） ==========
-@torch.no_grad()
-def fast_predict_middle_frame(model, val_diffusion, triplet_latent, mask, device):
-    """
-    快速预测中间帧（5步DDIM，节省显存）
-    Args:
-        triplet_latent: [B, 3, C, H, W]
-        mask: [B, 3, H, W]
-    Returns:
-        predicted_middle: [B, C, H, W]
-    """
-    z = torch.randn_like(triplet_latent.permute(0, 2, 1, 3, 4))
-    samples = val_diffusion.p_sample_loop(
-        model.forward, z.shape, z,
-        clip_denoised=False, progress=False, device=device,
-        raw_x=triplet_latent.permute(0, 2, 1, 3, 4),
-        mask=mask
-    )
-    samples = samples.permute(1, 0, 2, 3, 4)
-    predicted_middle = samples[:, 1, :, :, :].clone()
-    
-    # 立即释放
-    del samples, z
-    torch.cuda.empty_cache()
-    
-    return predicted_middle
-
-def backward_loss(loss, scaler=None, mixed_precision=True):
-    """Backward a scaled or unscaled loss tensor."""
-    if mixed_precision:
-        scaler.scale(loss).backward()
-    else:
-        loss.backward()
-
-
-def build_stage2_recursive_triplets(latent_dense):
-    """Build the extra recursive triplets used in stage2, excluding the base triplet."""
-    b, f, c, h, w = latent_dense.shape
-    assert f == 5, f"阶段2需要5帧，当前{f}帧"
-    return [
-        torch.stack([latent_dense[:, 0], latent_dense[:, 1], latent_dense[:, 2]], dim=1),
-        torch.stack([latent_dense[:, 2], latent_dense[:, 3], latent_dense[:, 4]], dim=1),
-    ]
-
-
-def build_stage3_recursive_triplets(latent_dense):
-    """Build the extra recursive triplets used in stage3, excluding the base triplet."""
-    b, f, c, h, w = latent_dense.shape
-    assert f == 9, f"阶段3需要9帧，当前{f}帧"
-    triplets = [
-        torch.stack([latent_dense[:, 0], latent_dense[:, 2], latent_dense[:, 4]], dim=1),
-        torch.stack([latent_dense[:, 4], latent_dense[:, 6], latent_dense[:, 8]], dim=1),
-    ]
-    for left, mid, right in [(0, 1, 2), (2, 3, 4), (4, 5, 6), (6, 7, 8)]:
-        triplets.append(torch.stack([latent_dense[:, left], latent_dense[:, mid], latent_dense[:, right]], dim=1))
-    return triplets
-
-
-def backward_recursive_triplets(
-    model,
-    diffusion,
-    triplets,
-    t,
-    device,
-    recursive_weight,
-    loss_scale_divisor,
-    scaler=None,
-    mixed_precision=True,
-    loss_target_mode="auto",
-    sync_last_backward=False,
-):
-    """
-    Backward each recursive triplet immediately to reduce peak memory.
-    Returns the mean recursive loss value for logging.
-    """
-    if not triplets:
-        return 0.0
-
-    loss_sum = 0.0
-    scaled_weight = recursive_weight / (len(triplets) * loss_scale_divisor)
-
-    for idx, triplet in enumerate(triplets):
-        should_sync = sync_last_backward and idx == len(triplets) - 1
-        with ddp_sync_context(model, should_sync=should_sync):
-            triplet_loss = compute_triplet_loss(
-                model,
-                diffusion,
-                triplet,
-                t,
-                None,
-                device,
-                loss_target_mode=loss_target_mode,
-            )
-            loss_sum += triplet_loss.detach().item()
-            backward_loss(
-                scaled_weight * triplet_loss,
-                scaler=scaler,
-                mixed_precision=mixed_precision,
-            )
-            del triplet_loss
-
-    torch.cuda.empty_cache()
-    return loss_sum / len(triplets)
 
 # -------------------------- 主训练函数（修改loss计算部分） --------------------------
 def main(args):
@@ -1347,8 +93,7 @@ def main(args):
     np.random.seed(seed)
 
     # 4. 实验目录（仅rank0创建）
-    model_string_name = args.model.replace("/", "-")
-    experiment_dir = f"{args.results_dir}/{model_string_name}_{args.cur_date}"
+    experiment_dir = resolve_experiment_dir(args)
     checkpoint_dir = f"{experiment_dir}/checkpoints"
     val_fold = f"{experiment_dir}/val_pic"
     log_level = str(getattr(args, "log_level", "INFO")).upper()
@@ -1783,6 +528,7 @@ def main(args):
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
     model.train()
     ema.eval()  # EMA始终保持eval模式
+    val_weight_source = "ema"
     running_loss = 0.0
     log_steps = 0
     start_time = time()
@@ -2132,6 +878,7 @@ def main(args):
                 train_steps=train_steps,
                 epoch=epoch + 1,
                 best_val_metric=best_val_metric,
+                val_weight_source=val_weight_source,
                 opt=opt,
                 lr_scheduler=lr_scheduler,
                 scaler=scaler,
@@ -2152,6 +899,7 @@ def main(args):
                 train_steps=train_steps,
                 epoch=epoch + 1,
                 best_val_metric=best_val_metric,
+                val_weight_source=val_weight_source,
                 opt=opt,
                 lr_scheduler=lr_scheduler,
                 scaler=scaler,
@@ -2171,6 +919,7 @@ def main(args):
         if rank == 0:
             model.eval()
             vae.eval()
+            ema.eval()
             val_diffusion = create_diffusion(
                 timestep_respacing=timestep_respacing_val,
                 diffusion_steps=args.diffusion_steps,
@@ -2198,7 +947,7 @@ def main(args):
                         device=device,
                         val_fold=val_fold,
                         generate_vessel_mask_adaptive=generate_vessel_mask_adaptive,
-                        raw_model=get_raw_model(model),
+                        raw_model=ema,
                         current_step=train_steps,
                         stage0_steps=args.stage0_steps,
                         stage1_steps=args.stage1_steps,
@@ -2246,6 +995,7 @@ def main(args):
         if (epoch + 1) % args.val_interval == 0:
             model.eval()
             vae.eval()
+            ema.eval()
             val_diffusion = create_diffusion(
                 timestep_respacing=timestep_respacing_val,
                 diffusion_steps=args.diffusion_steps,
@@ -2260,7 +1010,7 @@ def main(args):
                 logger.info(f"\n{'='*60}")
                 logger.info(
                     f"开始 {stage_name} 滑窗三连帧验证 | "
-                    f"代理任务: 首尾帧预测中间帧 | "
+                    f"代理任务: 首尾帧预测中间帧 | 权重: {val_weight_source} | "
                     f"triplet batch size={triplet_eval_batch_size}"
                 )
                 logger.info(f"{'='*60}\n")
@@ -2287,7 +1037,7 @@ def main(args):
                     for video_val in val_batch['videos']:
                         metrics = evaluate_video_sliding_triplets(
                             video_val,
-                            model_forward=get_raw_model(model).forward,
+                            model_forward=ema.forward,
                             vae=vae,
                             diffusion=val_diffusion,
                             device=device,
@@ -2364,6 +1114,7 @@ def main(args):
                         "train_steps": train_steps,
                         "prev_best_metric": prev_best,
                         "stage": stage_name,
+                        "val_weight_source": val_weight_source,
                         "triplet_metrics": {
                             "mae": val_mae,
                             "mse": val_mse,
@@ -2389,6 +1140,7 @@ def main(args):
                     train_steps=train_steps,
                     epoch=epoch + 1,
                     best_val_metric=best_val_metric,
+                    val_weight_source=val_weight_source,
                     opt=opt,
                     lr_scheduler=lr_scheduler,
                     scaler=scaler,
@@ -2416,75 +1168,6 @@ def main(args):
     cleanup()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/config_cta.yaml")
-    # ========== 新增参数：血管mask最大权重 ==========
-    parser.add_argument("--vessel_max_weight", type=float, default=None, help="Max weight for vessel region")
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default=None,
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Logging verbosity",
-    )
-    parser.add_argument(
-        "--tracker",
-        type=str,
-        default=None,
-        choices=["tensorboard", "wandb"],
-        help="Experiment tracking backend",
-    )
-    parser.add_argument(
-        "--wandb-project",
-        type=str,
-        default=None,
-        help="Weights & Biases project name",
-    )
-    parser.add_argument(
-        "--wandb-entity",
-        type=str,
-        default=None,
-        help="Weights & Biases entity/team",
-    )
-    parser.add_argument(
-        "--wandb-mode",
-        type=str,
-        default=None,
-        choices=["online", "offline", "disabled"],
-        help="Weights & Biases logging mode",
-    )
-    parser.add_argument(
-        "--wandb-run-name",
-        type=str,
-        default=None,
-        help="Weights & Biases run name",
-    )
-    parser.add_argument(
-        "--ddp-timeout-minutes",
-        type=int,
-        default=None,
-        help="Process group timeout in minutes for long rank-0 validation/checkpoint sections",
-    )
-    cli_args = parser.parse_args()
+    from training.common import run_train_entrypoint
 
-    config = OmegaConf.load(cli_args.config)
-    if cli_args.vessel_max_weight is not None:
-        if not hasattr(config, "vessel_mask") or config.vessel_mask is None:
-            config.vessel_mask = OmegaConf.create({})
-        config.vessel_mask.max_weight = cli_args.vessel_max_weight
-    if cli_args.log_level is not None:
-        config.log_level = cli_args.log_level
-    if cli_args.tracker is not None:
-        config.tracking_backend = cli_args.tracker
-    if cli_args.wandb_project is not None:
-        config.wandb_project = cli_args.wandb_project
-    if cli_args.wandb_entity is not None:
-        config.wandb_entity = cli_args.wandb_entity
-    if cli_args.wandb_mode is not None:
-        config.wandb_mode = cli_args.wandb_mode
-    if cli_args.wandb_run_name is not None:
-        config.wandb_run_name = cli_args.wandb_run_name
-    if cli_args.ddp_timeout_minutes is not None:
-        config.ddp_timeout_minutes = cli_args.ddp_timeout_minutes
-
-    main(config)
+    run_train_entrypoint(main, default_config="configs/config_cta.yaml")

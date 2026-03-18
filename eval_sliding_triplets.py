@@ -45,7 +45,9 @@ class DistributedEvalSampler(Sampler):
 
 
 def load_eval_state_dict(checkpoint, ckpt_mode):
-    mode = str(ckpt_mode or "raw").lower()
+    mode = str(ckpt_mode or "auto").lower()
+    if mode == "auto":
+        mode = str(checkpoint.get("val_weight_source", "raw")).lower()
     if mode == "ema" and "ema" in checkpoint:
         return checkpoint["ema"], "ema"
     return checkpoint["model"], "raw"
@@ -149,7 +151,7 @@ def main(args):
     respacing = resolve_respacing(args)
     triplet_eval_batch_size = int(getattr(args, "triplet_eval_batch_size", 4))
     loader_batch_size = resolve_loader_batch_size(args)
-    ckpt_mode = getattr(args, "test_ckpt_mode", "raw")
+    ckpt_mode = getattr(args, "test_ckpt_mode", "auto")
     checkpoint_path = None
 
     if not baseline_method:
@@ -348,7 +350,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="configs/config_cta.yaml")
     parser.add_argument("--split", type=str, choices=["val", "test"], help="Evaluation split. Defaults to val.")
     parser.add_argument("--ckpt", type=str, help="Checkpoint filename under experiment checkpoints/ or an absolute path.")
-    parser.add_argument("--ckpt-mode", type=str, choices=["raw", "ema"], help="Weight source inside checkpoint.")
+    parser.add_argument("--ckpt-mode", type=str, choices=["auto", "raw", "ema"], help="Weight source inside checkpoint.")
     parser.add_argument("--respacing", type=str, help="Override DDIM timestep respacing for evaluation.")
     parser.add_argument("--triplet-batch-size", type=int, help="Triplet batch size inside sliding-triplet evaluation.")
     parser.add_argument("--eval-batch-size", type=int, help="Sequence batch size for the outer DataLoader.")
