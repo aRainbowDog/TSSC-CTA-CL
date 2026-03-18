@@ -16,6 +16,7 @@ from models.model_dit import MVIF_models
 from train_mask_pred import apply_mask_pred_overrides, build_parser
 from training.checkpointing import resolve_experiment_dir, safe_load_checkpoint
 from training.common import create_logger_compat, distributed_barrier, parse_train_config
+from training.latent_utils import decode_latent_batch_to_image, encode_image_batch_to_latent
 from training.runtime import get_raw_model
 from training.validation_mask_pred import (
     DistributedEvalSampler,
@@ -131,9 +132,13 @@ def export_densified_sequences(
         video_names = batch["video_name"]
         dataset_indices = batch["dataset_index"].tolist()
 
-        with torch.cuda.amp.autocast(enabled=bool(args.mixed_precision)):
-            video_flat = video.reshape(-1, *video.shape[2:])
-            latent = vae.encode(video_flat).latent_dist.sample().mul_(0.18215)
+        video_flat = video.reshape(-1, *video.shape[2:])
+        latent = encode_image_batch_to_latent(
+            vae,
+            video_flat,
+            use_amp=bool(args.mixed_precision),
+            chunk_size=int(getattr(args, "vae_encode_batch_size", 0)),
+        )
         latent = latent.reshape(video.shape[0], video.shape[1], *latent.shape[1:])
 
         for batch_idx in range(video.shape[0]):
@@ -182,8 +187,12 @@ def export_densified_sequences(
                 use_amp=bool(args.mixed_precision),
             )
 
-            with torch.cuda.amp.autocast(enabled=bool(args.mixed_precision)):
-                decoded = vae.decode(reconstructed.reshape(-1, *reconstructed.shape[2:]) / 0.18215).sample
+            decoded = decode_latent_batch_to_image(
+                vae,
+                reconstructed.reshape(-1, *reconstructed.shape[2:]),
+                use_amp=bool(args.mixed_precision),
+                chunk_size=int(getattr(args, "vae_decode_batch_size", 0)),
+            )
             decoded = decoded.reshape(1, total_frames, *decoded.shape[1:])
             pred_video_eval = prepare_pred_video_for_eval(decoded.detach().cpu(), force_grayscale=True)
 
@@ -308,6 +317,8 @@ def main(args):
             mask_cfg=mask_cfg,
             use_amp=bool(args.mixed_precision),
             max_batches=int(args.max_batches),
+            vae_encode_batch_size=int(getattr(args, "vae_encode_batch_size", 0)),
+            vae_decode_batch_size=int(getattr(args, "vae_decode_batch_size", 0)),
         )
 
         if rank == 0:
@@ -344,6 +355,8 @@ def main(args):
                     epoch=0,
                     train_steps=int(checkpoint.get("train_steps", 0)),
                     use_amp=bool(args.mixed_precision),
+                    vae_encode_batch_size=int(getattr(args, "vae_encode_batch_size", 0)),
+                    vae_decode_batch_size=int(getattr(args, "vae_decode_batch_size", 0)),
                 )
         distributed_barrier()
     else:

@@ -44,6 +44,8 @@ num_workers: 0
 log_every: 1
 lr_warmup_steps: 0
 gradient_accumulation_steps: 1
+vae_encode_batch_size: 4
+vae_decode_batch_size: 8
 ddp_timeout_minutes: 60
 cuda_empty_cache_interval: 0
 val_interval: 1
@@ -53,7 +55,7 @@ val_visualization_batch_size: 1
 
 use_compile: false
 mixed_precision: True
-gradient_checkpointing: false
+gradient_checkpointing: True
 
 mask_prediction:
   timing_csv_path: "data/ctp_slice_timing/ctp_slice_timing.csv"

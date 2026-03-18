@@ -26,6 +26,7 @@ from training.checkpointing import (
     resolve_experiment_dir,
     safe_load_checkpoint,
 )
+from training.latent_utils import encode_image_batch_to_latent
 from training.common import (
     build_common_train_parser,
     create_logger_compat,
@@ -247,6 +248,8 @@ def run_validation(
         mask_cfg=args.mask_prediction,
         use_amp=bool(args.mixed_precision),
         max_batches=int(getattr(args, "val_max_batches", 0)),
+        vae_encode_batch_size=int(getattr(args, "vae_encode_batch_size", 0)),
+        vae_decode_batch_size=int(getattr(args, "vae_decode_batch_size", 0)),
     )
 
     if rank == 0:
@@ -289,6 +292,8 @@ def run_validation(
                 epoch=epoch,
                 train_steps=train_steps,
                 use_amp=bool(args.mixed_precision),
+                vae_encode_batch_size=int(getattr(args, "vae_encode_batch_size", 0)),
+                vae_decode_batch_size=int(getattr(args, "vae_decode_batch_size", 0)),
             )
             write_experiment_images(tracker, args.tracking_backend, generated_images, train_steps)
 
@@ -651,9 +656,14 @@ def main(args):
             valid_mask = batch["frame_valid_mask"].to(device, non_blocking=True)
             batch_size = video.shape[0]
 
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.mixed_precision):
+            with torch.no_grad():
                 video_flat = video.reshape(-1, *video.shape[2:])
-                latent = vae.encode(video_flat).latent_dist.sample().mul_(0.18215)
+                latent = encode_image_batch_to_latent(
+                    vae,
+                    video_flat,
+                    use_amp=bool(args.mixed_precision),
+                    chunk_size=int(getattr(args, "vae_encode_batch_size", 0)),
+                )
                 latent = latent.reshape(batch_size, sequence_length, *latent.shape[1:])
 
             frame_mask = sample_frame_mask_batch(valid_mask, args.mask_prediction, device=device)
@@ -701,7 +711,10 @@ def main(args):
                 set_optimizer_zeros_grad(opt)
                 train_steps += 1
 
-                ema_decay = get_ema_decay(train_steps)
+                ema_decay = get_ema_decay(
+                    train_steps,
+                    warmup_steps=int(getattr(args, "ema_warmup_steps", 1000)),
+                )
                 with torch.no_grad():
                     update_ema(ema, get_raw_model(model), decay=ema_decay)
 

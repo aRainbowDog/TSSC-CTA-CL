@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, Sampler, Subset
 from torchvision.utils import save_image
 
 from dataloader.data_loader_mask import collate_mask_prediction_batch
+from training.latent_utils import decode_latent_batch_to_image, encode_image_batch_to_latent
 from utils.triplet_eval import prepare_gt_video_for_eval, prepare_pred_video_for_eval
 
 
@@ -110,11 +111,15 @@ def reconstruct_masked_sequence(model_forward, diffusion, latent_sequence, frame
 
 
 @torch.no_grad()
-def decode_latent_sequence(vae, latent_sequence, use_amp=True):
+def decode_latent_sequence(vae, latent_sequence, use_amp=True, decode_batch_size=0):
     batch_size, sequence_length, channels, height, width = latent_sequence.shape
-    latent_flat = latent_sequence.reshape(-1, channels, height, width) / 0.18215
-    with torch.cuda.amp.autocast(enabled=use_amp):
-        decoded = vae.decode(latent_flat).sample
+    latent_flat = latent_sequence.reshape(-1, channels, height, width)
+    decoded = decode_latent_batch_to_image(
+        vae,
+        latent_flat,
+        use_amp=use_amp,
+        chunk_size=decode_batch_size,
+    )
     return decoded.reshape(batch_size, sequence_length, *decoded.shape[1:])
 
 
@@ -261,6 +266,8 @@ def evaluate_mask_prediction(
     mask_cfg,
     use_amp=True,
     max_batches=0,
+    vae_encode_batch_size=0,
+    vae_decode_batch_size=0,
 ):
     mode_names = get_validation_modes(mask_cfg)
     min_visible = int(mask_cfg.get("min_visible_frames", 2))
@@ -286,9 +293,13 @@ def evaluate_mask_prediction(
         valid_mask = batch["frame_valid_mask"].to(device, non_blocking=True)
         batch_size = video.shape[0]
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            video_flat = video.reshape(-1, *video.shape[2:])
-            latent = vae.encode(video_flat).latent_dist.sample().mul_(0.18215)
+        video_flat = video.reshape(-1, *video.shape[2:])
+        latent = encode_image_batch_to_latent(
+            vae,
+            video_flat,
+            use_amp=use_amp,
+            chunk_size=vae_encode_batch_size,
+        )
         latent = latent.reshape(batch_size, video.shape[1], *latent.shape[1:])
 
         gt_video_eval = prepare_gt_video_for_eval(video.detach().cpu())
@@ -314,7 +325,12 @@ def evaluate_mask_prediction(
                 device=device,
                 use_amp=use_amp,
             )
-            decoded_video = decode_latent_sequence(vae, reconstructed_latent, use_amp=use_amp)
+            decoded_video = decode_latent_sequence(
+                vae,
+                reconstructed_latent,
+                use_amp=use_amp,
+                decode_batch_size=vae_decode_batch_size,
+            )
             pred_video_eval = prepare_pred_video_for_eval(decoded_video.detach().cpu(), force_grayscale=True)
             batch_metrics = compute_masked_frame_metrics(
                 pred_video=pred_video_eval,
@@ -345,6 +361,8 @@ def save_mask_prediction_visualizations(
     epoch,
     train_steps,
     use_amp=True,
+    vae_encode_batch_size=0,
+    vae_decode_batch_size=0,
 ):
     if not sample_indices:
         return {}
@@ -374,9 +392,13 @@ def save_mask_prediction_visualizations(
         video_names = batch["video_name"]
         batch_size_current = video.shape[0]
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            video_flat = video.reshape(-1, *video.shape[2:])
-            latent = vae.encode(video_flat).latent_dist.sample().mul_(0.18215)
+        video_flat = video.reshape(-1, *video.shape[2:])
+        latent = encode_image_batch_to_latent(
+            vae,
+            video_flat,
+            use_amp=use_amp,
+            chunk_size=vae_encode_batch_size,
+        )
         latent = latent.reshape(batch_size_current, video.shape[1], *latent.shape[1:])
 
         gt_video_eval = prepare_gt_video_for_eval(video.detach().cpu())
@@ -399,7 +421,12 @@ def save_mask_prediction_visualizations(
                 device=device,
                 use_amp=use_amp,
             )
-            decoded_video = decode_latent_sequence(vae, reconstructed_latent, use_amp=use_amp)
+            decoded_video = decode_latent_sequence(
+                vae,
+                reconstructed_latent,
+                use_amp=use_amp,
+                decode_batch_size=vae_decode_batch_size,
+            )
             pred_video_eval = prepare_pred_video_for_eval(decoded_video.detach().cpu(), force_grayscale=True)
 
             frame_mask_vis = frame_mask.detach().cpu()[:, :, None, None, None]

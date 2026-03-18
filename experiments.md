@@ -69,7 +69,13 @@ Recommended single-GPU mask-pred training command:
 CUDA_VISIBLE_DEVICES=0 python train_mask_pred.py --config configs/config_mask_pred.yaml --log-level INFO
 ```
 
-Recommended multi-GPU mask-pred training command:
+Recommended 8-GPU mask-pred training command for the full experiment:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node=8 train_mask_pred.py --config configs/config_mask_pred.yaml
+```
+
+If you want a smaller multi-GPU run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 train_mask_pred.py --config configs/config_mask_pred.yaml
