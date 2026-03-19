@@ -9,6 +9,11 @@ It currently supports two experiment lines:
 - `mask_pred`
   - time-aware masked sequence reconstruction for sparse observed CTA sequences
 
+Default artifact layout:
+
+- training runs: `results/runs/{task}/...`
+- evaluation outputs: `results/eval/{task}/...`
+
 ## Main Entry Points
 
 Training uses the unified entrypoint:
@@ -25,6 +30,8 @@ The testing workflow is split into two stages:
    - run a checkpoint or baseline and save generated outputs
 2. `eval`
    - read saved outputs and compute metrics
+3. `visualize`
+   - read saved reconstruction outputs and export per-slice overview figures
 
 ## Quick Start
 
@@ -56,8 +63,17 @@ python test.py eval --task sliding_triplets --input-dir tmp/sliding_triplets_val
 Mask-pred reconstruction testing:
 
 ```bash
-python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage val --output-dir tmp/mask_pred_reconstruct_val
+python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage val --mask-mode single_mid --output-dir tmp/mask_pred_reconstruct_val
 python test.py eval --task mask_pred --input-dir tmp/mask_pred_reconstruct_val
+python test.py visualize --task mask_pred --input-dir tmp/mask_pred_reconstruct_val --output-dir tmp/mask_pred_reconstruct_val_figures
+```
+
+Mask-pred checkpoint testing on the test split:
+
+```bash
+python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --ckpt best_mask_pred.pth --output-dir tmp/mask_pred_reconstruct_test
+python test.py eval --task mask_pred --input-dir tmp/mask_pred_reconstruct_test
+python test.py visualize --task mask_pred --input-dir tmp/mask_pred_reconstruct_test --output-dir tmp/mask_pred_reconstruct_test_figures
 ```
 
 ## Documentation
@@ -66,6 +82,8 @@ Start with these files:
 
 - [experiments.md](experiments.md)
   - training and testing commands
+- [documentation/README.md](documentation/README.md)
+  - technical notes for model, testing, and output format
 - [mask_pred_experiment_protocol.md](mask_pred_experiment_protocol.md)
   - detailed mask-pred design and evaluation protocol
 - [data/ctp_slice_timing/README.md](data/ctp_slice_timing/README.md)

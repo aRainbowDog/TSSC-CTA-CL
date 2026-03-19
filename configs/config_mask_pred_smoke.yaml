@@ -4,7 +4,7 @@ data_path_train: "data/TSSC_stage1_dataset/train"
 data_path_test: "data/TSSC_stage1_dataset/test"
 pretrained_vae_model_path: "ckpts/"
 
-results_dir: "../results/runs_mask_pred_smoke"
+results_dir: "results/runs/mask_pred"
 pretrained: ""
 resume_from_checkpoint: false
 test_ckpt: ""

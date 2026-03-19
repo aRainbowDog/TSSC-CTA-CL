@@ -60,19 +60,20 @@ def _frame_to_gray_01(frame):
     return gray.detach().cpu().numpy().astype(np.float32)
 
 
-def _predict_middle_frame_dis_flow(start_frame, end_frame, method):
+def predict_intermediate_frame_dis_flow(start_frame, end_frame, alpha, method):
     start_gray = _frame_to_gray_01(start_frame)
     end_gray = _frame_to_gray_01(end_frame)
     start_u8 = np.clip(start_gray * 255.0, 0, 255).astype(np.uint8)
     end_u8 = np.clip(end_gray * 255.0, 0, 255).astype(np.uint8)
+    alpha = float(np.clip(alpha, 0.0, 1.0))
 
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
     grid_y, grid_x = np.mgrid[0:start_gray.shape[0], 0:start_gray.shape[1]].astype(np.float32)
 
     if method == "si_dis_flow":
         flow_forward = dis.calc(start_u8, end_u8, None)
-        map_x = (grid_x + flow_forward[..., 0] * 0.5).astype(np.float32)
-        map_y = (grid_y + flow_forward[..., 1] * 0.5).astype(np.float32)
+        map_x = (grid_x + flow_forward[..., 0] * alpha).astype(np.float32)
+        map_y = (grid_y + flow_forward[..., 1] * alpha).astype(np.float32)
         pred_gray = cv2.remap(
             np.ascontiguousarray(start_gray, dtype=np.float32),
             map_x,
@@ -85,24 +86,28 @@ def _predict_middle_frame_dis_flow(start_frame, end_frame, method):
         flow_backward = dis.calc(end_u8, start_u8, None)
         warp_f = cv2.remap(
             np.ascontiguousarray(start_gray, dtype=np.float32),
-            (grid_x + flow_forward[..., 0] * 0.5).astype(np.float32),
-            (grid_y + flow_forward[..., 1] * 0.5).astype(np.float32),
+            (grid_x + flow_forward[..., 0] * alpha).astype(np.float32),
+            (grid_y + flow_forward[..., 1] * alpha).astype(np.float32),
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE,
         )
         warp_b = cv2.remap(
             np.ascontiguousarray(end_gray, dtype=np.float32),
-            (grid_x + flow_backward[..., 0] * 0.5).astype(np.float32),
-            (grid_y + flow_backward[..., 1] * 0.5).astype(np.float32),
+            (grid_x + flow_backward[..., 0] * (1.0 - alpha)).astype(np.float32),
+            (grid_y + flow_backward[..., 1] * (1.0 - alpha)).astype(np.float32),
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE,
         )
-        pred_gray = 0.5 * warp_f + 0.5 * warp_b
+        pred_gray = (1.0 - alpha) * warp_f + alpha * warp_b
     else:
         raise ValueError(f"Unsupported DIS flow baseline method: {method}")
 
     pred_gray = np.clip(pred_gray, 0.0, 1.0)
     return torch.from_numpy(pred_gray * 2.0 - 1.0).float().unsqueeze(0)
+
+
+def _predict_middle_frame_dis_flow(start_frame, end_frame, method):
+    return predict_intermediate_frame_dis_flow(start_frame, end_frame, alpha=0.5, method=method)
 
 
 def predict_middle_frames_from_triplets_baseline(

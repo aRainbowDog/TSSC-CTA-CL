@@ -165,7 +165,8 @@ def create_logger(logging_dir, level="INFO", console=None, use_rich=True):
     if not isinstance(level_value, int):
         raise ValueError(f"Unsupported log level: {level}")
 
-    if dist.get_rank() == 0:  # real logger
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    if rank == 0:  # real logger
         handlers = []
         if use_rich:
             handlers.append(

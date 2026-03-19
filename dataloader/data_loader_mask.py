@@ -57,6 +57,8 @@ class mask_prediction_data_loader(torch.utils.data.Dataset):
             self.data_path = configs.data_path_test
             self.video_lists = get_filelist(self.data_path)
 
+        self.video_lists = self._filter_videos_with_timing(self.video_lists)
+
         if is_main_process():
             logger.info(
                 f"[{self.stage}] Mask prediction dataset size: {len(self.video_lists)} | "
@@ -83,6 +85,28 @@ class mask_prediction_data_loader(torch.utils.data.Dataset):
         if not slice_match:
             raise ValueError(f"文件名 {file_name} 未匹配到 slice_XX 格式")
         return patient_key, int(slice_match.group(1))
+
+    def _filter_videos_with_timing(self, video_lists):
+        filtered_videos = []
+        skipped = []
+        for path in video_lists:
+            patient_key, slice_index = self._extract_patient_and_slice(path)
+            try:
+                self.timing_index.get_slice_sequence(patient_key, slice_index)
+            except KeyError as exc:
+                skipped.append((path, str(exc)))
+                continue
+            filtered_videos.append(path)
+
+        if skipped and is_main_process():
+            skipped_patients = sorted({os.path.basename(os.path.dirname(path)) for path, _ in skipped})
+            preview = ", ".join(skipped_patients[:10])
+            suffix = "" if len(skipped_patients) <= 10 else f", ... (+{len(skipped_patients) - 10} more)"
+            logger.warning(
+                f"[{self.stage}] Skipping {len(skipped)} videos without timing metadata from "
+                f"{len(skipped_patients)} patients. Patients: {preview}{suffix}"
+            )
+        return filtered_videos
 
     def _align_sequence_length(self, video, timing_rows):
         real_frame_count = min(video.shape[0], len(timing_rows), self.sequence_length)

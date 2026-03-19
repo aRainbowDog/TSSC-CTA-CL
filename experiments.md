@@ -6,6 +6,11 @@ Run from the repo root:
 cd /Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL
 ```
 
+Result layout:
+
+- training runs: `results/runs/{task}/...`
+- evaluation outputs: `results/eval/{task}/...`
+
 Use [train.py](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/train.py) as the unified training entrypoint.
 Select the setup with `--task curriculum` or `--task mask_pred`.
 
@@ -98,149 +103,218 @@ Use [test.py](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/test.py) as the
 
 - `infer` runs a checkpoint or baseline on a dataset split and saves generated outputs under `predictions/`.
 - `eval` reads those saved outputs and writes `eval_summary.json`.
+- `visualize` reads saved reconstruction outputs and exports per-slice GT/pred overview figures.
+
+## Testing Summary
+
+Current runnable baselines:
+
+- `sliding_triplets`: 3 runnable baselines
+  - `linear`
+  - `si_dis_flow`
+  - `bi_dis_flow`
+- `mask_pred reconstruct`: 4 runnable baselines
+  - `nearest`
+  - `linear`
+  - `si_dis_flow`
+  - `bi_dis_flow`
+
+Important:
+
+- `quadratic` exists historically on the triplet side but is **not** supported in the current sliding-triplet protocol.
+- `sliding_triplets` baselines and `mask_pred` baselines are **not** the same test protocol.
+- If you want to compare against the current mask-pred model, use the `mask_pred` reconstruct protocol, not `sliding_triplets`.
 
 ## Sliding-Triplet Testing
 
-The `sliding_triplets` task uses the same protocol as training validation:
+Protocol:
 
-- for each real CTA sequence, build all consecutive 3-frame windows
+- build all consecutive 3-frame windows from each real sequence
 - use the first and third frames as input
 - predict the middle frame
 - compute `MAE`, `MSE`, and `PSNR` only on the predicted middle frames
 
-Run validation-split inference:
+### Model checkpoint
+
+Validation split:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --output-dir tmp/sliding_triplets_val
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --output-dir results/eval/sliding_triplets/val/model_default
+python test.py eval --task sliding_triplets --input-dir results/eval/sliding_triplets/val/model_default
 ```
 
-Then evaluate the saved outputs:
+Test split with a specific checkpoint:
 
 ```bash
-python test.py eval --task sliding_triplets --input-dir tmp/sliding_triplets_val
-```
-
-Run test-split inference with a specific checkpoint:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode raw --output-dir tmp/sliding_triplets_test_raw
-```
-
-Evaluate those saved test outputs:
-
-```bash
-python test.py eval --task sliding_triplets --input-dir tmp/sliding_triplets_test_raw
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode raw --output-dir results/eval/sliding_triplets/test/best_epoch_train_model_raw
+python test.py eval --task sliding_triplets --input-dir results/eval/sliding_triplets/test/best_epoch_train_model_raw
 ```
 
 Use EMA weights instead of raw weights:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode ema --output-dir tmp/sliding_triplets_test_ema
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode ema --output-dir results/eval/sliding_triplets/test/best_epoch_train_model_ema
 ```
 
-Override the sampler respacing:
+Override sampler respacing:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode raw --respacing ddim20 --output-dir tmp/sliding_triplets_test_ddim20
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode raw --respacing ddim20 --output-dir results/eval/sliding_triplets/test/best_epoch_train_model_raw_ddim20
 ```
 
-Run multi-GPU inference:
+Multi-GPU inference:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --output-dir tmp/sliding_triplets_test_multi
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --output-dir results/eval/sliding_triplets/test/model_multi_gpu
 ```
 
-Run baseline methods with the same protocol:
+### Baselines
+
+Linear:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --baseline-method linear --output-dir tmp/sliding_triplets_linear
+python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --baseline-method linear --output-dir results/eval/sliding_triplets/val/baseline_linear
+python test.py eval --task sliding_triplets --input-dir results/eval/sliding_triplets/val/baseline_linear
 ```
 
-```bash
-python test.py eval --task sliding_triplets --input-dir tmp/sliding_triplets_linear
-```
+Single-direction DIS flow:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --baseline-method si_dis_flow --output-dir tmp/sliding_triplets_si_dis_flow
+python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --baseline-method si_dis_flow --output-dir results/eval/sliding_triplets/val/baseline_si_dis_flow
+python test.py eval --task sliding_triplets --input-dir results/eval/sliding_triplets/val/baseline_si_dis_flow
 ```
 
+Bidirectional DIS flow:
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --baseline-method bi_dis_flow --output-dir tmp/sliding_triplets_bi_dis_flow
+python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --baseline-method bi_dis_flow --output-dir results/eval/sliding_triplets/val/baseline_bi_dis_flow
+python test.py eval --task sliding_triplets --input-dir results/eval/sliding_triplets/val/baseline_bi_dis_flow
 ```
 
 Notes:
 
-- `quadratic` is not supported in this protocol because its original implementation uses the center frame as an interpolation anchor.
-- `--split val` reads the last 10% of `data_path_train`, matching training validation.
+- `quadratic` is not supported because its original implementation uses the center frame as an interpolation anchor.
+- `--split val` uses the deterministic train/val split from `data_path_train`.
 - `--split test` reads `data_path_test`.
-- If `--output-dir` is omitted, infer outputs are written under the experiment directory in `test/sliding_triplets/<split>/...`.
+- These baselines are only comparable to the `sliding_triplets` task.
+- Sliding-triplet baselines now run on a CPU-only single-process path; do not launch them with `torchrun`.
+- If `--output-dir` is omitted, outputs are written under `results/eval/sliding_triplets/<split>/...`.
 
 ## Mask-Pred Testing
 
 The `mask_pred` task supports two inference modes:
 
 - `reconstruct`
-  - save held-out sparse-frame reconstructions for later offline eval
+  - save held-out sparse-frame reconstructions for offline `eval` and `visualize`
 - `densify`
   - export denser generated sequences from sparse observed anchors
 
-Run reconstruction inference on the validation split:
+Supported reconstruction protocols:
+
+- `single_mid`
+  - mask one deterministic internal frame near the middle of the sequence
+- `single_all`
+  - iterate over all internal observed frames, save one record per target frame, then aggregate offline
+
+`single` is kept as an alias of `single_mid` for backward compatibility.
+
+### Model checkpoint
+
+Default behavior:
+
+- if `--ckpt` is omitted, `mask_pred` testing uses `best_mask_pred.pth` if it exists, otherwise `latest_mask_pred.pth`
+- relative checkpoint names such as `best_mask_pred.pth` are resolved under the experiment `checkpoints/` directory
+- absolute checkpoint paths are also supported
+
+Validation split with the current default-style protocol:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage val --output-dir tmp/mask_pred_reconstruct_val
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage val --mask-mode single_mid --output-dir results/eval/mask_pred/reconstruct/val/model_single_mid
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/val/model_single_mid
+python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/val/model_single_mid --output-dir results/eval/mask_pred/reconstruct/val/model_single_mid_figures
 ```
 
-Then evaluate the saved reconstruction outputs:
+Test split with a specific saved checkpoint:
 
 ```bash
-python test.py eval --task mask_pred --input-dir tmp/mask_pred_reconstruct_val
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --ckpt best_mask_pred.pth --output-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_single_all
+python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_single_all --output-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_single_all_figures
 ```
 
-Run reconstruction inference on the test split with a specific checkpoint:
+Force raw or EMA weights:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --ckpt best_mask_pred.pth --output-dir tmp/mask_pred_reconstruct_test
-```
-
-Evaluate those saved test outputs:
-
-```bash
-python test.py eval --task mask_pred --input-dir tmp/mask_pred_reconstruct_test
-```
-
-Force raw or EMA weights during reconstruction inference:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --ckpt best_mask_pred.pth --use-ema false --output-dir tmp/mask_pred_reconstruct_raw
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --ckpt best_mask_pred.pth --use-ema false --output-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_raw_single_all
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --ckpt best_mask_pred.pth --use-ema true --output-dir tmp/mask_pred_reconstruct_ema
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --ckpt best_mask_pred.pth --use-ema true --output-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_ema_single_all
 ```
 
-Run multi-GPU reconstruction inference:
+Multi-GPU reconstruction inference:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --output-dir tmp/mask_pred_reconstruct_test_multi
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --output-dir results/eval/mask_pred/reconstruct/test/model_single_all_multi_gpu
 ```
 
-Run densification export at `1 FPS` on the test split:
+### Baselines Under the Same Reconstruct Protocol
+
+Nearest-frame baseline:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0 --output-dir tmp/mask_pred_densify_test
+python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --baseline-method nearest --output-dir results/eval/mask_pred/reconstruct/test/baseline_nearest_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_nearest_single_all
+python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_nearest_single_all --output-dir results/eval/mask_pred/reconstruct/test/baseline_nearest_single_all_figures
 ```
 
-Export only a limited number of densified samples:
+Linear baseline:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0 --max-samples 16 --output-dir tmp/mask_pred_densify_test_small
+python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --baseline-method linear --output-dir results/eval/mask_pred/reconstruct/test/baseline_linear_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_linear_single_all
+python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_linear_single_all --output-dir results/eval/mask_pred/reconstruct/test/baseline_linear_single_all_figures
+```
+
+Single-direction DIS flow baseline:
+
+```bash
+python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --baseline-method si_dis_flow --output-dir results/eval/mask_pred/reconstruct/test/baseline_si_dis_flow_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_si_dis_flow_single_all
+python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_si_dis_flow_single_all --output-dir results/eval/mask_pred/reconstruct/test/baseline_si_dis_flow_single_all_figures
+```
+
+Bidirectional DIS flow baseline:
+
+```bash
+python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --baseline-method bi_dis_flow --output-dir results/eval/mask_pred/reconstruct/test/baseline_bi_dis_flow_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_bi_dis_flow_single_all
+python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_bi_dis_flow_single_all --output-dir results/eval/mask_pred/reconstruct/test/baseline_bi_dis_flow_single_all_figures
+```
+
+### Densify Export
+
+Export densified sequences at `1 FPS`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0 --output-dir results/eval/mask_pred/densify/test/densify_1fps
+```
+
+Limit the number of exported samples:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0 --max-samples 16 --output-dir results/eval/mask_pred/densify/test/densify_1fps_small
 ```
 
 Notes:
 
-- Reconstruction `eval` reads the saved `.pt` outputs from `infer` and writes `eval_summary.json`.
-- Reconstruction `infer` uses the current mask-pred validation protocol from [config_mask_pred.yaml](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/configs/config_mask_pred.yaml). With the current default config, this is `single`-frame masking only.
+- `reconstruct` is the main quantitative testing path for mask-pred.
+- `eval` and `visualize` both consume the saved `.pt` outputs from `infer`; neither reruns inference.
+- `visualize` writes one overview figure per slice and aggregates all saved targets for that slice.
 - `--stage val` uses the same deterministic train/val split as mask-pred training.
 - `--stage test` reads `data_path_test`.
-- `densify` mode has no offline `eval` step because no dense GT sequence is available.
-- If `--output-dir` is omitted, infer outputs are written under the corresponding mask-pred experiment directory in `test/mask_pred/...`.
+- `--baseline-method` is only supported with `--mode reconstruct`.
+- The current mask-pred baselines are `nearest`, `linear`, `si_dis_flow`, and `bi_dis_flow`.
+- Mask-pred baselines now run on a CPU-only single-process path; do not launch them with `torchrun`.
+- `densify` has no offline numeric `eval` because no dense GT sequence is available.
+- If `--output-dir` is omitted, outputs are written under `results/eval/mask_pred/...`.

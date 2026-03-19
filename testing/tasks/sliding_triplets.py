@@ -9,14 +9,13 @@ from diffusers.models import AutoencoderKL
 from omegaconf import OmegaConf
 from skimage.metrics import peak_signal_noise_ratio
 from torch.utils.data import DataLoader, Sampler
-from tqdm import tqdm
-
 from dataloader.data_loader_acdc import collate_full_sequence_batch, full_sequence_data_loader
 from models.diffusion.gaussian_diffusion import create_diffusion
 from models.model_dit import MVIF_models
 from testing.common import (
     add_root_test_args,
     build_sample_key,
+    default_eval_dir,
     list_prediction_files,
     load_manifest,
     sanitize_name,
@@ -25,7 +24,7 @@ from testing.common import (
     write_json,
     write_manifest,
 )
-from training.common import distributed_barrier
+from training.common import create_rich_progress, distributed_barrier
 from utils.triplet_eval import (
     evaluate_video_sliding_triplets,
     evaluate_video_sliding_triplets_baseline,
@@ -128,7 +127,6 @@ def apply_overrides(config, cli_args):
 
 
 def build_default_output_dir(args, checkpoint_path, baseline_method, resolved_mode, respacing):
-    experiment_dir = resolve_experiment_dir(args)
     split = str(getattr(args, "eval_split", "val")).lower()
     run_name = baseline_method or os.path.splitext(os.path.basename(checkpoint_path))[0]
     dir_name = "_".join(
@@ -138,7 +136,7 @@ def build_default_output_dir(args, checkpoint_path, baseline_method, resolved_mo
             sanitize_name(respacing),
         ]
     )
-    return os.path.join(experiment_dir, "test", "sliding_triplets", split, dir_name)
+    return default_eval_dir(args.results_dir, "sliding_triplets", split, dir_name)
 
 
 def build_infer_parser():
@@ -175,29 +173,36 @@ def build_eval_parser():
 
 
 def run_infer(args):
+    baseline_method = getattr(args, "eval_baseline_method", None)
+    baseline_method = str(baseline_method).lower() if baseline_method else None
     requested_gpu = getattr(args, "test_gpu_id", None)
     is_distributed = "RANK" in os.environ or "WORLD_SIZE" in os.environ or "LOCAL_RANK" in os.environ
-    if requested_gpu and not is_distributed:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(requested_gpu)
+    if baseline_method:
+        if is_distributed and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+            raise ValueError("sliding-triplets baselines use a CPU-only single-process path. Run them without torchrun/DDP.")
+        rank, local_rank, world_size = 0, 0, 1
+        device = torch.device("cpu")
+    else:
+        if requested_gpu and not is_distributed:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(requested_gpu)
 
-    ddp_timeout_minutes = int(getattr(args, "ddp_timeout_minutes", 180))
-    rank, local_rank, world_size = setup_distributed(timeout_minutes=ddp_timeout_minutes)
-    device = torch.device("cuda", local_rank)
-    torch.cuda.set_device(device)
+        ddp_timeout_minutes = int(getattr(args, "ddp_timeout_minutes", 180))
+        rank, local_rank, world_size = setup_distributed(timeout_minutes=ddp_timeout_minutes)
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
 
     seed = int(getattr(args, "global_seed", 3407)) + rank
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = True
+    if device.type == "cuda":
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = True
 
     eval_split = str(getattr(args, "eval_split", "val")).lower()
     if eval_split not in {"val", "test"}:
         raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split}")
 
-    baseline_method = getattr(args, "eval_baseline_method", None)
-    baseline_method = str(baseline_method).lower() if baseline_method else None
     if baseline_method == "quadratic":
         raise ValueError(
             "quadratic baseline cannot be evaluated with the validation-style sliding-triplet protocol. "
@@ -283,61 +288,76 @@ def run_infer(args):
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         drop_last=False,
         collate_fn=collate_full_sequence_batch,
     )
 
     local_saved = 0
-    progress = tqdm(loader, total=len(loader), desc=f"{eval_split} sliding infer", disable=rank != 0)
-    with torch.no_grad():
-        for batch in progress:
-            for video, video_name, video_path in zip(
-                batch["videos"],
-                batch["video_name"],
-                batch["video_path"],
-            ):
-                metrics = (
-                    evaluate_video_sliding_triplets(
-                        video,
-                        model_forward=model.forward,
-                        vae=vae,
-                        diffusion=diffusion,
-                        device=device,
-                        triplet_batch_size=triplet_eval_batch_size,
-                        return_pred_video=True,
-                        force_grayscale=True,
+    progress = None
+    infer_task = None
+    if rank == 0:
+        progress = create_rich_progress()
+        progress.start()
+        progress_total = len(loader)
+        infer_task = progress.add_task(
+            f"{eval_split} sliding infer",
+            total=max(1, progress_total),
+            completed=0,
+            status="saved 0",
+        )
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                for video, video_name, video_path in zip(
+                    batch["videos"],
+                    batch["video_name"],
+                    batch["video_path"],
+                ):
+                    metrics = (
+                        evaluate_video_sliding_triplets(
+                            video,
+                            model_forward=model.forward,
+                            vae=vae,
+                            diffusion=diffusion,
+                            device=device,
+                            triplet_batch_size=triplet_eval_batch_size,
+                            return_pred_video=True,
+                            force_grayscale=True,
+                        )
+                        if not baseline_method
+                        else evaluate_video_sliding_triplets_baseline(
+                            video,
+                            method=baseline_method,
+                            triplet_batch_size=triplet_eval_batch_size,
+                            return_pred_video=True,
+                            force_grayscale=True,
+                        )
                     )
-                    if not baseline_method
-                    else evaluate_video_sliding_triplets_baseline(
-                        video,
-                        method=baseline_method,
-                        triplet_batch_size=triplet_eval_batch_size,
-                        return_pred_video=True,
-                        force_grayscale=True,
-                    )
-                )
 
-                triplet_count = int(metrics["count"])
-                gt_video = metrics["gt_video"]
-                pred_video = metrics["pred_video"]
-                sample_key = build_sample_key(video_name, sha1_short(video_path))
-                save_prediction_record(
-                    output_dir,
-                    sample_key,
-                    {
-                        "task": "sliding_triplets",
-                        "split": eval_split,
-                        "video_name": video_name,
-                        "video_path": video_path,
-                        "triplet_count": triplet_count,
-                        "gt_middle": gt_video[1:-1].to(dtype=torch.float16),
-                        "pred_middle": pred_video[1:-1].to(dtype=torch.float16),
-                    },
-                )
-                local_saved += 1
-                if rank == 0:
-                    progress.set_postfix({"saved": local_saved})
+                    triplet_count = int(metrics["count"])
+                    gt_video = metrics["gt_video"]
+                    pred_video = metrics["pred_video"]
+                    sample_key = build_sample_key(video_name, sha1_short(video_path))
+                    save_prediction_record(
+                        output_dir,
+                        sample_key,
+                        {
+                            "task": "sliding_triplets",
+                            "split": eval_split,
+                            "video_name": video_name,
+                            "video_path": video_path,
+                            "triplet_count": triplet_count,
+                            "gt_middle": gt_video[1:-1].to(dtype=torch.float16),
+                            "pred_middle": pred_video[1:-1].to(dtype=torch.float16),
+                        },
+                    )
+                    local_saved += 1
+                if progress is not None and infer_task is not None:
+                    progress.update(infer_task, advance=1, status=f"saved {local_saved}")
+    finally:
+        if progress is not None:
+            progress.stop()
 
     saved_tensor = torch.tensor([local_saved], dtype=torch.long, device=device)
     if world_size > 1:
@@ -363,34 +383,42 @@ def run_eval(args):
     total_triplet_count = 0
     total_video_count = 0
 
-    for prediction_path in prediction_files:
-        record = torch.load(prediction_path, map_location="cpu")
-        if record.get("task") != "sliding_triplets":
-            raise ValueError(f"Unexpected record type in {prediction_path}")
+    progress = create_rich_progress()
+    progress.start()
+    eval_task = progress.add_task("sliding_triplets eval", total=len(prediction_files), completed=0, status="videos 0")
+    try:
+        for prediction_path in prediction_files:
+            record = torch.load(prediction_path, map_location="cpu")
+            if record.get("task") != "sliding_triplets":
+                raise ValueError(f"Unexpected record type in {prediction_path}")
 
-        gt_middle = record["gt_middle"].float()
-        pred_middle = record["pred_middle"].float()
-        triplet_count = int(record.get("triplet_count", gt_middle.shape[0]))
-        if triplet_count <= 0:
-            continue
+            gt_middle = record["gt_middle"].float()
+            pred_middle = record["pred_middle"].float()
+            triplet_count = int(record.get("triplet_count", gt_middle.shape[0]))
+            if triplet_count <= 0:
+                progress.update(eval_task, advance=1, status=f"videos {total_video_count}")
+                continue
 
-        pred_np = pred_middle.numpy()
-        gt_np = gt_middle.numpy()
-        pred_flat = pred_np.reshape(pred_np.shape[0], -1)
-        gt_flat = gt_np.reshape(gt_np.shape[0], -1)
+            pred_np = pred_middle.numpy()
+            gt_np = gt_middle.numpy()
+            pred_flat = pred_np.reshape(pred_np.shape[0], -1)
+            gt_flat = gt_np.reshape(gt_np.shape[0], -1)
 
-        total_mae += float(np.sum(np.abs(pred_flat - gt_flat).mean(axis=1)))
-        total_mse += float(np.sum(((pred_flat - gt_flat) ** 2).mean(axis=1)))
-        total_psnr += float(
-            np.sum(
-                [
-                    peak_signal_noise_ratio(gt_np[idx], pred_np[idx], data_range=2.0)
-                    for idx in range(gt_np.shape[0])
-                ]
+            total_mae += float(np.sum(np.abs(pred_flat - gt_flat).mean(axis=1)))
+            total_mse += float(np.sum(((pred_flat - gt_flat) ** 2).mean(axis=1)))
+            total_psnr += float(
+                np.sum(
+                    [
+                        peak_signal_noise_ratio(gt_np[idx], pred_np[idx], data_range=2.0)
+                        for idx in range(gt_np.shape[0])
+                    ]
+                )
             )
-        )
-        total_triplet_count += triplet_count
-        total_video_count += 1
+            total_triplet_count += triplet_count
+            total_video_count += 1
+            progress.update(eval_task, advance=1, status=f"videos {total_video_count}")
+    finally:
+        progress.stop()
 
     global_triplet_count = max(total_triplet_count, 1)
     avg_total_mse = total_mse / global_triplet_count

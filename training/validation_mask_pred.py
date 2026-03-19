@@ -49,25 +49,52 @@ def get_validation_modes(mask_cfg):
     return [str(mode) for mode in list(modes)]
 
 
-def build_validation_frame_mask(valid_mask, mode, min_visible=2, span_length=2, device=None):
+def canonicalize_validation_mode(mode):
+    mode_name = str(mode).strip().lower()
+    if mode_name == "single":
+        return "single_mid"
+    return mode_name
+
+
+def build_validation_frame_mask_variants(valid_mask, mode, min_visible=2, span_length=2, device=None):
     device = device or valid_mask.device
     batch_size, sequence_length = valid_mask.shape
-    frame_mask = torch.zeros(batch_size, sequence_length, dtype=torch.float32, device=device)
+    canonical_mode = canonicalize_validation_mode(mode)
 
+    if canonical_mode == "single_all":
+        variants = []
+        for target_idx in range(sequence_length):
+            frame_mask = torch.zeros(batch_size, sequence_length, dtype=torch.float32, device=device)
+            has_any = False
+            for batch_idx in range(batch_size):
+                valid_indices = torch.nonzero(valid_mask[batch_idx] > 0.5, as_tuple=False).flatten().tolist()
+                if len(valid_indices) <= min_visible:
+                    continue
+                internal_candidates = valid_indices[1:-1] if len(valid_indices) > 2 else []
+                if target_idx in internal_candidates:
+                    frame_mask[batch_idx, target_idx] = 1.0
+                    has_any = True
+            if has_any:
+                variants.append((f"frame_{target_idx:02d}", frame_mask))
+        return variants
+
+    frame_mask = torch.zeros(batch_size, sequence_length, dtype=torch.float32, device=device)
+    variant_name = canonical_mode
     for batch_idx in range(batch_size):
         valid_indices = torch.nonzero(valid_mask[batch_idx] > 0.5, as_tuple=False).flatten().tolist()
         if len(valid_indices) <= min_visible:
             continue
 
-        if mode == "single":
+        if canonical_mode == "single_mid":
             single_candidates = valid_indices[1:-1] if len(valid_indices) > 2 else valid_indices
             masked_indices = [single_candidates[len(single_candidates) // 2]]
-        elif mode == "span":
+            variant_name = "mid"
+        elif canonical_mode == "span":
             max_span = max(1, len(valid_indices) - min_visible)
             current_span = min(max(1, int(span_length)), max_span)
             start = max(0, (len(valid_indices) - current_span) // 2)
             masked_indices = valid_indices[start:start + current_span]
-        elif mode == "anchor":
+        elif canonical_mode == "anchor":
             anchor_count = max(2, int(min_visible))
             anchor_positions = np.linspace(0, len(valid_indices) - 1, num=min(anchor_count, len(valid_indices)))
             visible_indices = {valid_indices[int(round(pos))] for pos in anchor_positions}
@@ -79,7 +106,23 @@ def build_validation_frame_mask(valid_mask, mode, min_visible=2, span_length=2, 
 
         frame_mask[batch_idx, masked_indices] = 1.0
 
-    return frame_mask
+    if float(frame_mask.sum().item()) <= 0:
+        return []
+    return [(variant_name, frame_mask)]
+
+
+def build_validation_frame_mask(valid_mask, mode, min_visible=2, span_length=2, device=None):
+    variants = build_validation_frame_mask_variants(
+        valid_mask=valid_mask,
+        mode=mode,
+        min_visible=min_visible,
+        span_length=span_length,
+        device=device,
+    )
+    if variants:
+        return variants[0][1]
+    device = device or valid_mask.device
+    return torch.zeros(valid_mask.shape[0], valid_mask.shape[1], dtype=torch.float32, device=device)
 
 
 @torch.no_grad()
@@ -306,40 +349,38 @@ def evaluate_mask_prediction(
         valid_mask_cpu = valid_mask.detach().cpu()
 
         for mode_name in mode_names:
-            frame_mask = build_validation_frame_mask(
+            frame_mask_variants = build_validation_frame_mask_variants(
                 valid_mask=valid_mask,
                 mode=mode_name,
                 min_visible=min_visible,
                 span_length=span_length,
                 device=device,
             )
-            if float(frame_mask.sum().item()) <= 0:
-                continue
-
-            reconstructed_latent = reconstruct_masked_sequence(
-                model_forward=model_forward,
-                diffusion=diffusion,
-                latent_sequence=latent,
-                frame_times=frame_times,
-                frame_mask=frame_mask,
-                device=device,
-                use_amp=use_amp,
-            )
-            decoded_video = decode_latent_sequence(
-                vae,
-                reconstructed_latent,
-                use_amp=use_amp,
-                decode_batch_size=vae_decode_batch_size,
-            )
-            pred_video_eval = prepare_pred_video_for_eval(decoded_video.detach().cpu(), force_grayscale=True)
-            batch_metrics = compute_masked_frame_metrics(
-                pred_video=pred_video_eval,
-                gt_video=gt_video_eval,
-                frame_mask=frame_mask.detach().cpu(),
-                valid_mask=valid_mask_cpu,
-            )
-            for key, value in batch_metrics.items():
-                metric_totals[mode_name][key] += value
+            for _, frame_mask in frame_mask_variants:
+                reconstructed_latent = reconstruct_masked_sequence(
+                    model_forward=model_forward,
+                    diffusion=diffusion,
+                    latent_sequence=latent,
+                    frame_times=frame_times,
+                    frame_mask=frame_mask,
+                    device=device,
+                    use_amp=use_amp,
+                )
+                decoded_video = decode_latent_sequence(
+                    vae,
+                    reconstructed_latent,
+                    use_amp=use_amp,
+                    decode_batch_size=vae_decode_batch_size,
+                )
+                pred_video_eval = prepare_pred_video_for_eval(decoded_video.detach().cpu(), force_grayscale=True)
+                batch_metrics = compute_masked_frame_metrics(
+                    pred_video=pred_video_eval,
+                    gt_video=gt_video_eval,
+                    frame_mask=frame_mask.detach().cpu(),
+                    valid_mask=valid_mask_cpu,
+                )
+                for key, value in batch_metrics.items():
+                    metric_totals[mode_name][key] += value
 
         del batch, video, frame_times, valid_mask, video_flat, latent
 
@@ -405,62 +446,66 @@ def save_mask_prediction_visualizations(
         sequence_length = gt_video_eval.shape[1]
 
         for mode_name in mode_names:
-            frame_mask = build_validation_frame_mask(
+            frame_mask_variants = build_validation_frame_mask_variants(
                 valid_mask=valid_mask,
                 mode=mode_name,
                 min_visible=min_visible,
                 span_length=span_length,
                 device=device,
             )
-            reconstructed_latent = reconstruct_masked_sequence(
-                model_forward=model_forward,
-                diffusion=diffusion,
-                latent_sequence=latent,
-                frame_times=frame_times,
-                frame_mask=frame_mask,
-                device=device,
-                use_amp=use_amp,
-            )
-            decoded_video = decode_latent_sequence(
-                vae,
-                reconstructed_latent,
-                use_amp=use_amp,
-                decode_batch_size=vae_decode_batch_size,
-            )
-            pred_video_eval = prepare_pred_video_for_eval(decoded_video.detach().cpu(), force_grayscale=True)
+            for variant_name, frame_mask in frame_mask_variants:
+                reconstructed_latent = reconstruct_masked_sequence(
+                    model_forward=model_forward,
+                    diffusion=diffusion,
+                    latent_sequence=latent,
+                    frame_times=frame_times,
+                    frame_mask=frame_mask,
+                    device=device,
+                    use_amp=use_amp,
+                )
+                decoded_video = decode_latent_sequence(
+                    vae,
+                    reconstructed_latent,
+                    use_amp=use_amp,
+                    decode_batch_size=vae_decode_batch_size,
+                )
+                pred_video_eval = prepare_pred_video_for_eval(decoded_video.detach().cpu(), force_grayscale=True)
 
-            frame_mask_vis = frame_mask.detach().cpu()[:, :, None, None, None]
-            masked_input = gt_video_eval * (1 - frame_mask_vis) + (-1.0) * frame_mask_vis
-            mask_row = frame_mask_vis.expand_as(gt_video_eval) * 2 - 1
+                frame_mask_vis = frame_mask.detach().cpu()[:, :, None, None, None]
+                masked_input = gt_video_eval * (1 - frame_mask_vis) + (-1.0) * frame_mask_vis
+                mask_row = frame_mask_vis.expand_as(gt_video_eval) * 2 - 1
 
-            for sample_offset, dataset_index in enumerate(dataset_indices):
-                image_tensor = torch.cat(
-                    [
-                        gt_video_eval[sample_offset:sample_offset + 1],
-                        masked_input[sample_offset:sample_offset + 1],
-                        pred_video_eval[sample_offset:sample_offset + 1],
-                        mask_row[sample_offset:sample_offset + 1],
-                    ],
-                    dim=1,
-                )
-                image_tensor = image_tensor.reshape(-1, *image_tensor.shape[2:])
-                image_path = os.path.join(
-                    output_dir,
-                    f"epoch_{epoch + 1:04d}_step_{train_steps:07d}_{mode_name}_idx_{dataset_index:04d}.png",
-                )
-                save_image(
-                    image_tensor,
-                    image_path,
-                    nrow=sequence_length,
-                    normalize=True,
-                    value_range=(-1, 1),
-                )
-                generated_images[f"Val_MaskPred/{mode_name}"].append(
-                    {
-                        "path": image_path,
-                        "caption": f"Epoch {epoch + 1} step {train_steps} {mode_name} {video_names[sample_offset]}",
-                    }
-                )
+                for sample_offset, dataset_index in enumerate(dataset_indices):
+                    image_tensor = torch.cat(
+                        [
+                            gt_video_eval[sample_offset:sample_offset + 1],
+                            masked_input[sample_offset:sample_offset + 1],
+                            pred_video_eval[sample_offset:sample_offset + 1],
+                            mask_row[sample_offset:sample_offset + 1],
+                        ],
+                        dim=1,
+                    )
+                    image_tensor = image_tensor.reshape(-1, *image_tensor.shape[2:])
+                    image_path = os.path.join(
+                        output_dir,
+                        f"epoch_{epoch + 1:04d}_step_{train_steps:07d}_{mode_name}_{variant_name}_idx_{dataset_index:04d}.png",
+                    )
+                    save_image(
+                        image_tensor,
+                        image_path,
+                        nrow=sequence_length,
+                        normalize=True,
+                        value_range=(-1, 1),
+                    )
+                    generated_images[f"Val_MaskPred/{mode_name}"].append(
+                        {
+                            "path": image_path,
+                            "caption": (
+                                f"Epoch {epoch + 1} step {train_steps} "
+                                f"{mode_name}/{variant_name} {video_names[sample_offset]}"
+                            ),
+                        }
+                    )
 
         del batch, video, frame_times, valid_mask, video_flat, latent
 

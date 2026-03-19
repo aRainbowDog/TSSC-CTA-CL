@@ -12,7 +12,7 @@ TASK_MODULES = {
 
 def build_bootstrap_parser():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("action", choices=["infer", "eval"])
+    parser.add_argument("action", choices=["infer", "eval", "visualize"])
     parser.add_argument("--task", type=str, required=True)
     return parser
 
@@ -26,6 +26,13 @@ def main(argv=None):
 
     if bootstrap_args.action == "infer":
         module.run_infer_cli(argv)
+        return
+
+    if bootstrap_args.action == "visualize":
+        visualize_cli = getattr(module, "run_visualize_cli", None)
+        if visualize_cli is None:
+            raise ValueError(f"Task {task!r} does not support the visualize action.")
+        visualize_cli(argv)
         return
 
     module.run_eval_cli(argv)

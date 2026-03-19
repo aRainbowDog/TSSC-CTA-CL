@@ -8,7 +8,7 @@ data_path_test: "data/TSSC_stage1_dataset/test"
 pretrained_vae_model_path: "ckpts/"
 
 # save and load
-results_dir: "../results/runs_CurriculumLearning_v260310"  # 新版本
+results_dir: "results/runs/curriculum"  # 新版本
 pretrained: ""
 resume_from_checkpoint: false
 test_ckpt: ""

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+from pathlib import Path
 
 
 TASK_ALIAS_MAP = {
@@ -101,3 +102,23 @@ def list_prediction_files(input_dir: str):
         if file_name.endswith(".pt")
     ]
     return sorted(files)
+
+
+def resolve_results_root(results_dir: str) -> str:
+    resolved = Path(results_dir).resolve()
+    parts = list(resolved.parts)
+    if "runs" in parts:
+        runs_idx = parts.index("runs")
+        if runs_idx > 0:
+            return str(Path(*parts[:runs_idx]))
+    if resolved.name:
+        return str(resolved.parent)
+    return str(resolved)
+
+
+def default_eval_dir(results_dir: str, task: str, *subdirs: str) -> str:
+    base = Path(resolve_results_root(results_dir)) / "eval" / sanitize_name(task)
+    for subdir in subdirs:
+        if str(subdir or "").strip():
+            base = base / sanitize_name(subdir)
+    return str(base)
