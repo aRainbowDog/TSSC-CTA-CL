@@ -360,16 +360,18 @@ class GaussianDiffusion:
         B, C = x.shape[:2]
         
         assert t.shape == (B,)
-        x = x.permute(0, 2, 1, 3, 4)           # b, f, c, h, w
-        raw_x = raw_x.permute(0, 2, 1, 3, 4)   # b, f, c, h, w
+        x_video = x.permute(0, 2, 1, 3, 4)     # b, f, c, h, w
+        mask_bcthw = None if mask is None else self._expand_video_mask(mask, x)
 
         if not self.training and mask is not None:
-            model_input = raw_x.permute(2, 0, 1, 3, 4) * (1-mask) + x.permute(2, 0, 1, 3, 4) * mask
-            model_input = model_input.permute(1, 2, 0, 3, 4)
+            if raw_x is None:
+                raise ValueError("raw_x must be provided for masked sampling during evaluation")
+            raw_x_video = raw_x.permute(0, 2, 1, 3, 4)   # b, f, c, h, w
+            mask_video = mask_bcthw.permute(0, 2, 1, 3, 4)
+            model_input = raw_x_video * (1 - mask_video) + x_video * mask_video
             model_output = model(model_input, t, **model_kwargs)
         else:
-            model_output = model(x, t, **model_kwargs)
-        x = x.permute(0, 2, 1, 3, 4)    # b, c, f, h, w
+            model_output = model(x_video, t, **model_kwargs)
         if not self.training:
             model_output = model_output.permute(0, 2, 1, 3, 4)
 
@@ -426,6 +428,29 @@ class GaussianDiffusion:
             "pred_xstart": pred_xstart,
             "extra": extra,
         }
+
+    def _expand_video_mask(self, mask, x_bcthw):
+        """
+        Normalize video masks to [B, C_or_1, T, H, W].
+        Supported inputs:
+          - [B, T, H, W]
+          - [B, 1, T, H, W]
+          - [B, C, T, H, W]
+        """
+        if mask.ndim == 4:
+            expected = (x_bcthw.shape[0], x_bcthw.shape[2], x_bcthw.shape[3], x_bcthw.shape[4])
+            if tuple(mask.shape) != expected:
+                raise ValueError(f"Expected mask shape {expected}, got {tuple(mask.shape)}")
+            return mask[:, None, :, :, :]
+        if mask.ndim == 5:
+            expected_tail = (x_bcthw.shape[0], x_bcthw.shape[2], x_bcthw.shape[3], x_bcthw.shape[4])
+            if mask.shape[0] != expected_tail[0] or tuple(mask.shape[2:]) != expected_tail[1:]:
+                raise ValueError(
+                    f"Mask batch/time/spatial dims must match {expected_tail}, got {tuple(mask.shape)}"
+                )
+            if mask.shape[1] in {1, x_bcthw.shape[1]}:
+                return mask
+        raise ValueError(f"Unsupported mask shape {tuple(mask.shape)} for input {tuple(x_bcthw.shape)}")
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
@@ -672,18 +697,19 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)  # [b, c, f, h, w]
+        mask_5d = self._expand_video_mask(mask, x_start) if mask is not None else None
 
         terms = {}
 
         if self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            x_t = x_t.permute(0, 2, 1, 3, 4)    # [b, f, c, h, w]
-            # mask, C B T H W
-            model_input = x_start.permute(1, 0, 2, 3, 4) * (1-mask) + x_t.permute(2, 0, 1, 3, 4) * mask
-            # C B T H W -> B T C H W
-            model_input = model_input.permute(1, 2, 0, 3, 4)
+            if mask_5d is None:
+                raise ValueError("training_losses requires a mask for masked video diffusion training")
+            model_input = (
+                x_start.permute(0, 2, 1, 3, 4) * (1 - mask_5d.permute(0, 2, 1, 3, 4))
+                + x_t.permute(0, 2, 1, 3, 4) * mask_5d.permute(0, 2, 1, 3, 4)
+            )
             model_output = model(model_input, t, **model_kwargs)   # [b, f, c, h, w]
 
-            x_t = x_t.permute(0, 2, 1, 3, 4)   # [b, c, f, h, w]
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
@@ -719,7 +745,7 @@ class GaussianDiffusion:
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape #([2, 4, 16, 16, 16]
 
-            terms["mse"] = mean_flat(((target - model_output).permute(1, 0, 2, 3, 4) * mask).permute(1, 0, 2, 3, 4)  ** 2)
+            terms["mse"] = mean_flat(((target - model_output) * mask_5d) ** 2)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:

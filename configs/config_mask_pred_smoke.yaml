@@ -1,0 +1,83 @@
+eval_only: false
+
+data_path_train: "data/TSSC_stage1_dataset/train"
+data_path_test: "data/TSSC_stage1_dataset/test"
+pretrained_vae_model_path: "ckpts/"
+
+results_dir: "../results/runs_mask_pred_smoke"
+pretrained: ""
+resume_from_checkpoint: false
+test_ckpt: ""
+test_ckpt_mode: ""
+
+gpu_id: "0"
+test_gpu_id: "0"
+cur_date: MASK_PRED_SMOKE
+model: MVIF-L/2
+tar_num_frames: 15
+image_size: 256
+diffusion_steps: 50
+learn_sigma: True
+train_batch_size: 1
+val_batch_size: 1
+test_batch_size: 1
+num_classes: 1
+
+log_level: "INFO"
+tracking_backend: null
+wandb_project: "TSSC-CTA-CL"
+wandb_entity: "mvi-cta"
+wandb_mode: "disabled"
+wandb_run_name: "TSSC-MaskPred-Smoke"
+
+save_ceph: False
+learning_rate: 5e-5
+ckpt_every_iter: 2
+clip_max_norm: 1.0
+start_clip_iter: 0
+max_train_steps: 4
+timestep_respacing_train: ""
+timestep_respacing_val: "ddim5"
+timestep_respacing_test: "ddim5"
+global_seed: 3407
+num_workers: 0
+log_every: 1
+lr_warmup_steps: 0
+gradient_accumulation_steps: 1
+vae_encode_batch_size: 4
+vae_decode_batch_size: 8
+ddp_timeout_minutes: 60
+cuda_empty_cache_interval: 0
+val_interval: 1
+val_max_batches: 1
+val_visualization_count: 2
+val_visualization_batch_size: 1
+
+use_compile: false
+mixed_precision: True
+gradient_checkpointing: True
+
+mask_prediction:
+  timing_csv_path: "data/ctp_slice_timing/ctp_slice_timing.csv"
+  time_field: "normalized_time"
+  sequence_length: 15
+  loss_target_mode: "auto"
+  min_visible_frames: 2
+  min_masked_frames: 1
+  max_masked_frames: 1
+  single_frame_mask_prob: 1.0
+  contiguous_span_mask_prob: 0.0
+  anchor_drop_mask_prob: 0.0
+  single_mask_internal_only: true
+  validation_modes: ["single"]
+  validation_span_length: 1
+  eval_use_ema: true
+
+time_conditioning:
+  enable: true
+  field: "normalized_time"
+
+vessel_mask:
+  enable: false
+  max_weight: 10.0
+  base_weight: 1.0
