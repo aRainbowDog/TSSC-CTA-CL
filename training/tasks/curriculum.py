@@ -1166,8 +1166,3 @@ def main(args):
         logger.info(f"Training finished! Total steps: {train_steps}")
         close_experiment_tracker(tracker, args.tracking_backend)
     cleanup()
-
-if __name__ == "__main__":
-    from training.common import run_train_entrypoint
-
-    run_train_entrypoint(main, default_config="configs/config_cta.yaml")

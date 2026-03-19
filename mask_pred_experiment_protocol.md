@@ -87,7 +87,7 @@ This keeps backward compatibility with the curriculum training path.
 
 Training entrypoint:
 
-- `train_mask_pred.py`
+- `train.py --task mask_pred`
 
 Core objective:
 
@@ -144,8 +144,8 @@ Relevant code:
 
 - `utils/utils.py`
 - `training/runtime.py`
-- `train_mask_pred.py`
-- `infer_mask_pred.py`
+- `training/tasks/mask_pred.py`
+- `testing/tasks/mask_pred.py`
 
 Current behavior:
 
@@ -182,7 +182,7 @@ Validation is **not** triplet-based anymore.
 Validation code:
 
 - `training/validation_mask_pred.py`
-- invoked from `train_mask_pred.py`
+- invoked from `training/tasks/mask_pred.py`
 
 Validation split:
 
@@ -290,7 +290,11 @@ Purpose:
 
 Test entrypoint:
 
-- `infer_mask_pred.py`
+- `test.py infer --task mask_pred`
+
+Offline metric entrypoint:
+
+- `test.py eval --task mask_pred`
 
 There are two test modes.
 
@@ -314,9 +318,10 @@ Procedure:
 1. Load a checkpoint.
 2. Load the full sparse sequence with timestamps.
 3. Apply one or more deterministic validation/test mask modes.
-4. Reconstruct the hidden observed frames.
-5. Compute `MAE/MSE/PSNR/SSIM` only on the hidden observed frames.
-6. Export a JSON summary and optional visualizations.
+4. Reconstruct the hidden observed frames and save per-sample outputs.
+5. Run offline eval on the saved outputs.
+6. Compute `MAE/MSE/PSNR/SSIM` only on the hidden observed frames.
+7. Export `eval_summary.json` and optional visualizations.
 
 This is the main quantitative evaluation protocol for the mask-pred model.
 
@@ -417,7 +422,7 @@ Current status for the mask-pred pipeline:
 The vessel-mask logic currently exists only in the older curriculum-learning path:
 
 - `training/vessel_mask.py`
-- `train_CurriculumLearning.py`
+- `training/tasks/curriculum.py`
 
 Implication:
 
@@ -453,19 +458,25 @@ For densification experiments, report at least:
 Training:
 
 ```bash
-python train_mask_pred.py --config configs/config_mask_pred.yaml
+python train.py --task mask_pred --config configs/config_mask_pred.yaml
 ```
 
-Quantitative reconstruction eval:
+Reconstruction infer:
 
 ```bash
-python infer_mask_pred.py --config configs/config_mask_pred.yaml --mode reconstruct --stage val
+python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage val --output-dir tmp/mask_pred_reconstruct_val
+```
+
+Offline reconstruction eval:
+
+```bash
+python test.py eval --task mask_pred --input-dir tmp/mask_pred_reconstruct_val
 ```
 
 Densification export:
 
 ```bash
-python infer_mask_pred.py --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0
+python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0 --output-dir tmp/mask_pred_densify_test
 ```
 
 ## 15. Current Open Gaps

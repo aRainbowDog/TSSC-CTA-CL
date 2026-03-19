@@ -33,7 +33,6 @@ from training.common import (
     create_rich_progress,
     distributed_barrier,
     maybe_cleanup_cuda,
-    parse_train_config,
 )
 from training.losses_mask_pred import compute_masked_sequence_loss, sample_frame_mask_batch
 from training.runtime import ddp_sync_context, get_raw_model, set_optimizer_zeros_grad
@@ -60,8 +59,8 @@ from utils.utils import (
 warnings.filterwarnings("ignore")
 
 
-def build_parser():
-    parser = build_common_train_parser(default_config="configs/config_mask_pred.yaml")
+def build_parser(default_config="configs/config_mask_pred.yaml"):
+    parser = build_common_train_parser(default_config=default_config)
     parser.add_argument(
         "--timing-csv",
         type=str,
@@ -891,10 +890,3 @@ def main(args):
             train_progress.stop()
         close_experiment_tracker(tracker, tracking_backend)
     cleanup()
-
-
-if __name__ == "__main__":
-    parser = build_parser()
-    config, cli_args = parse_train_config(parser=parser, default_config="configs/config_mask_pred.yaml")
-    config = apply_mask_pred_overrides(config, cli_args)
-    main(config)

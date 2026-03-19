@@ -6,7 +6,10 @@ Run from the repo root:
 cd /Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL
 ```
 
-Before starting, update these paths in [config_cta.yaml](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/configs/config_cta.yaml):
+Use [train.py](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/train.py) as the unified training entrypoint.
+Select the setup with `--task curriculum` or `--task mask_pred`.
+
+Before starting curriculum training, update these paths in [config_cta.yaml](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/configs/config_cta.yaml):
 
 - `data_path_train`
 - `data_path_test`
@@ -18,28 +21,22 @@ Before starting, update these paths in [config_cta.yaml](/Users/liskie/Projects/
 AutoencoderKL.from_pretrained(args.pretrained_vae_model_path, subfolder="sd-vae-ft-mse")
 ```
 
-Recommended single-GPU training command:
+Recommended single-GPU curriculum training command:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_CurriculumLearning.py --config configs/config_cta.yaml  --log-level INFO
+CUDA_VISIBLE_DEVICES=0 python train.py --task curriculum --config configs/config_cta.yaml --log-level INFO
 ```
 
-If you want to suppress debug diagnostics, keep the default:
+Detailed debug logging:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_CurriculumLearning.py --config configs/config_cta.yaml --log-level INFO
+CUDA_VISIBLE_DEVICES=0 python train.py --task curriculum --config configs/config_cta.yaml --log-level DEBUG
 ```
 
-If you want the detailed debug traces, use:
+Recommended multi-GPU curriculum training command:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_CurriculumLearning.py --config configs/config_cta.yaml --log-level DEBUG
-```
-
-Recommended multi-GPU training command:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node=8 train_CurriculumLearning.py --config configs/config_cta.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node=8 train.py --task curriculum --config configs/config_cta.yaml
 ```
 
 Notes:
@@ -50,7 +47,7 @@ Notes:
 
 # Mask Prediction Training
 
-Before starting, update these paths in [config_mask_pred.yaml](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/configs/config_mask_pred.yaml):
+Before starting mask-pred training, update these paths in [config_mask_pred.yaml](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/configs/config_mask_pred.yaml):
 
 - `data_path_train`
 - `data_path_test`
@@ -66,25 +63,25 @@ AutoencoderKL.from_pretrained(args.pretrained_vae_model_path, subfolder="sd-vae-
 Recommended single-GPU mask-pred training command:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_mask_pred.py --config configs/config_mask_pred.yaml --log-level INFO
+CUDA_VISIBLE_DEVICES=0 python train.py --task mask_pred --config configs/config_mask_pred.yaml --log-level INFO
 ```
 
-Recommended 8-GPU mask-pred training command for the full experiment:
+Recommended 8-GPU mask-pred training command:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node=8 train_mask_pred.py --config configs/config_mask_pred.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node=8 train.py --task mask_pred --config configs/config_mask_pred.yaml
 ```
 
-If you want a smaller multi-GPU run:
+Smaller multi-GPU run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 train_mask_pred.py --config configs/config_mask_pred.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 train.py --task mask_pred --config configs/config_mask_pred.yaml
 ```
 
 Resume mask-pred training from the latest checkpoint:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_mask_pred.py --config configs/config_mask_pred.yaml
+CUDA_VISIBLE_DEVICES=0 python train.py --task mask_pred --config configs/config_mask_pred.yaml
 ```
 
 Then set `resume_from_checkpoint: true` in [config_mask_pred.yaml](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/configs/config_mask_pred.yaml).
@@ -95,135 +92,155 @@ Notes:
 - The current default validation protocol is also `single`-only: mask one internal observed frame and use all other observed frames as context.
 - Vessel-weighted loss is available through `vessel_mask.enable`, but the default is `false`.
 
-# Evaluation
+# Testing
 
-The standalone evaluation script [eval_sliding_triplets.py](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/eval_sliding_triplets.py) uses the same sliding-triplet protocol as training validation:
+Use [test.py](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/test.py) as the unified testing entrypoint.
+
+- `infer` runs a checkpoint or baseline on a dataset split and saves generated outputs under `predictions/`.
+- `eval` reads those saved outputs and writes `eval_summary.json`.
+
+## Sliding-Triplet Testing
+
+The `sliding_triplets` task uses the same protocol as training validation:
 
 - for each real CTA sequence, build all consecutive 3-frame windows
 - use the first and third frames as input
 - predict the middle frame
-- compute `MAE`, `MSE`, and `PSNR` only on the middle frame
+- compute `MAE`, `MSE`, and `PSNR` only on the predicted middle frames
 
-Run validation-style evaluation on the validation split:
+Run validation-split inference:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval_sliding_triplets.py --config configs/config_cta.yaml --split val
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --output-dir tmp/sliding_triplets_val
 ```
 
-Run the same protocol on the test split:
+Then evaluate the saved outputs:
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 python eval_sliding_triplets.py --config configs/config_cta.yaml --split test
+python test.py eval --task sliding_triplets --input-dir tmp/sliding_triplets_val
 ```
 
-Run the same protocol with multi-GPU parallel evaluation:
+Run test-split inference with a specific checkpoint:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 eval_sliding_triplets.py --config configs/config_cta.yaml --split test
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode raw --output-dir tmp/sliding_triplets_test_raw
 ```
 
-Evaluate a specific checkpoint:
+Evaluate those saved test outputs:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval_sliding_triplets.py --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode raw
+python test.py eval --task sliding_triplets --input-dir tmp/sliding_triplets_test_raw
 ```
 
-Evaluate EMA weights instead of raw weights:
+Use EMA weights instead of raw weights:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval_sliding_triplets.py --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode ema
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode ema --output-dir tmp/sliding_triplets_test_ema
 ```
 
-Force the same sampler respacing as training validation:
+Override the sampler respacing:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval_sliding_triplets.py --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode raw --respacing ddim20
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --ckpt best_epoch_train_model.pth --ckpt-mode raw --respacing ddim20 --output-dir tmp/sliding_triplets_test_ddim20
 ```
 
-Run baseline methods with the same sliding-triplet protocol:
+Run multi-GPU inference:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval_sliding_triplets.py --config configs/config_cta.yaml --split val --baseline-method linear
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 test.py infer --task sliding_triplets --config configs/config_cta.yaml --split test --output-dir tmp/sliding_triplets_test_multi
+```
+
+Run baseline methods with the same protocol:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --baseline-method linear --output-dir tmp/sliding_triplets_linear
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 eval_sliding_triplets.py --config configs/config_cta.yaml --split val --baseline-method linear
+python test.py eval --task sliding_triplets --input-dir tmp/sliding_triplets_linear
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval_sliding_triplets.py --config configs/config_cta.yaml --split val --baseline-method si_dis_flow
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --baseline-method si_dis_flow --output-dir tmp/sliding_triplets_si_dis_flow
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval_sliding_triplets.py --config configs/config_cta.yaml --split val --baseline-method bi_dis_flow
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task sliding_triplets --config configs/config_cta.yaml --split val --baseline-method bi_dis_flow --output-dir tmp/sliding_triplets_bi_dis_flow
 ```
 
 Notes:
 
-- `quadratic` is not supported in this validation-style protocol because its original implementation uses the center frame as an interpolation anchor.
+- `quadratic` is not supported in this protocol because its original implementation uses the center frame as an interpolation anchor.
 - `--split val` reads the last 10% of `data_path_train`, matching training validation.
 - `--split test` reads `data_path_test`.
-- By default, validation-style evaluation logs are written under the experiment directory in `validation_style_eval/<split>/`.
+- If `--output-dir` is omitted, infer outputs are written under the experiment directory in `test/sliding_triplets/<split>/...`.
 
-# Mask Prediction Evaluation
+## Mask-Pred Testing
 
-The standalone mask-pred evaluation script [infer_mask_pred.py](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/infer_mask_pred.py) supports two modes:
+The `mask_pred` task supports two inference modes:
 
 - `reconstruct`
-  - quantitative held-out sparse-frame reconstruction
+  - save held-out sparse-frame reconstructions for later offline eval
 - `densify`
   - export denser generated sequences from sparse observed anchors
 
-Run quantitative reconstruction evaluation on the validation split:
+Run reconstruction inference on the validation split:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python infer_mask_pred.py --config configs/config_mask_pred.yaml --mode reconstruct --stage val
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage val --output-dir tmp/mask_pred_reconstruct_val
 ```
 
-Run quantitative reconstruction evaluation on the test split:
+Then evaluate the saved reconstruction outputs:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python infer_mask_pred.py --config configs/config_mask_pred.yaml --mode reconstruct --stage test
+python test.py eval --task mask_pred --input-dir tmp/mask_pred_reconstruct_val
 ```
 
-Evaluate a specific mask-pred checkpoint:
+Run reconstruction inference on the test split with a specific checkpoint:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python infer_mask_pred.py --config configs/config_mask_pred.yaml --mode reconstruct --stage test --ckpt best_mask_pred.pth
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --ckpt best_mask_pred.pth --output-dir tmp/mask_pred_reconstruct_test
 ```
 
-Force raw or EMA weights during reconstruction evaluation:
+Evaluate those saved test outputs:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python infer_mask_pred.py --config configs/config_mask_pred.yaml --mode reconstruct --stage test --ckpt best_mask_pred.pth --use-ema false
+python test.py eval --task mask_pred --input-dir tmp/mask_pred_reconstruct_test
+```
+
+Force raw or EMA weights during reconstruction inference:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --ckpt best_mask_pred.pth --use-ema false --output-dir tmp/mask_pred_reconstruct_raw
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python infer_mask_pred.py --config configs/config_mask_pred.yaml --mode reconstruct --stage test --ckpt best_mask_pred.pth --use-ema true
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --ckpt best_mask_pred.pth --use-ema true --output-dir tmp/mask_pred_reconstruct_ema
 ```
 
-Run multi-GPU reconstruction evaluation:
+Run multi-GPU reconstruction inference:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 infer_mask_pred.py --config configs/config_mask_pred.yaml --mode reconstruct --stage test
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --output-dir tmp/mask_pred_reconstruct_test_multi
 ```
 
 Run densification export at `1 FPS` on the test split:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python infer_mask_pred.py --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0 --output-dir tmp/mask_pred_densify_test
 ```
 
 Export only a limited number of densified samples:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python infer_mask_pred.py --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0 --max-samples 16
+CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode densify --stage test --densify-fps 1.0 --max-samples 16 --output-dir tmp/mask_pred_densify_test_small
 ```
 
 Notes:
 
-- Reconstruction evaluation uses the current mask-pred validation protocol from [config_mask_pred.yaml](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/configs/config_mask_pred.yaml). With the current default config, this is `single`-frame masking only.
+- Reconstruction `eval` reads the saved `.pt` outputs from `infer` and writes `eval_summary.json`.
+- Reconstruction `infer` uses the current mask-pred validation protocol from [config_mask_pred.yaml](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/configs/config_mask_pred.yaml). With the current default config, this is `single`-frame masking only.
 - `--stage val` uses the same deterministic train/val split as mask-pred training.
 - `--stage test` reads `data_path_test`.
-- `densify` mode does not compute quantitative reconstruction metrics because no dense GT sequence is available.
-- By default, reconstruction outputs and densified exports are written under the corresponding mask-pred experiment directory.
+- `densify` mode has no offline `eval` step because no dense GT sequence is available.
+- If `--output-dir` is omitted, infer outputs are written under the corresponding mask-pred experiment directory in `test/mask_pred/...`.
