@@ -103,6 +103,31 @@ This format allows offline metric computation and offline visualization without 
 - `gt_target_frames`
 - `pred_target_frames`
 
+The offline eval path now expects exactly one `mode_name` per input directory.
+It writes a flattened single-mode `overall` summary with:
+
+- `metric`
+- `mae`
+- `mse`
+- `psnr`
+- `ssim`
+- `lpips`
+- `fid`
+
+When `--roi-mask-root` is provided, it only changes the pixel-wise metric scope:
+
+- `mae`
+- `mse`
+- `psnr`
+
+These three are computed inside the union vessel ROI, while:
+
+- `ssim`
+- `lpips`
+- `fid`
+
+remain full-frame metrics.
+
 This logic is implemented in [testing/tasks/mask_pred.py](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/testing/tasks/mask_pred.py#L685) and uses the shared metric helpers from [training/validation_mask_pred.py](/Users/liskie/Projects/PycharmProjects/TSSC-CTA-CL/training/validation_mask_pred.py#L126).
 
 ## 7. Offline visualization

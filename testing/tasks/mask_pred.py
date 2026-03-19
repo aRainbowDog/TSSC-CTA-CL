@@ -1,7 +1,9 @@
 import argparse
 import os
 import random
+import re
 import warnings
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -9,6 +11,8 @@ import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw
+from scipy import linalg
+import torch.nn.functional as F
 from torchvision.utils import save_image
 
 from dataloader.data_loader_mask import collate_mask_prediction_batch, mask_prediction_data_loader
@@ -91,6 +95,18 @@ def build_eval_parser():
     add_root_test_args(parser, action="eval", task_aliases=["mask_pred", "mask_prediction", "mask-pred"])
     parser.add_argument("--input-dir", type=str, required=True, help="Directory produced by `test.py infer --task mask_pred --mode reconstruct`.")
     parser.add_argument("--output-dir", type=str, default=None, help="Optional directory for eval summary. Defaults to the input dir.")
+    parser.add_argument(
+        "--roi-mask-root",
+        type=str,
+        default=None,
+        help="Optional root dir for per-slice ROI masks. Expected layout: <root>/<stage>/<patient>/slice_xxx/mask_union.png",
+    )
+    parser.add_argument(
+        "--perceptual-batch-size",
+        type=int,
+        default=32,
+        help="Batch size used for LPIPS/FID feature extraction.",
+    )
     return parser
 
 
@@ -187,6 +203,242 @@ def build_default_output_dir(args):
     else:
         dir_name = f"densify_{args.stage}_{sanitize_name(f'{float(args.densify_fps):g}fps')}"
         return default_eval_dir(args.results_dir, "mask_pred", "densify", args.stage, dir_name)
+
+
+@lru_cache(maxsize=16384)
+def _load_union_roi_mask(mask_path):
+    mask = np.array(Image.open(mask_path).convert("L"), dtype=np.float32)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D ROI mask at {mask_path}, got shape {mask.shape}")
+    return mask > 127.5
+
+
+def _resolve_record_roi_mask_path(record, roi_mask_root):
+    stage = str(record.get("stage", "")).strip()
+    video_path = str(record.get("video_path", "")).strip()
+    video_name = str(record.get("video_name", "")).strip()
+
+    patient_key = os.path.basename(os.path.dirname(video_path)) if video_path else ""
+    if not patient_key and "_slice_" in video_name:
+        patient_key = video_name.rsplit("_slice_", 1)[0]
+    if not patient_key:
+        raise ValueError(f"Unable to resolve patient key from record: video_path={video_path}, video_name={video_name}")
+
+    slice_match = re.search(r"slice_(\d+)", os.path.basename(video_path)) if video_path else None
+    if slice_match is None:
+        slice_match = re.search(r"slice_(\d+)", video_name)
+    if slice_match is None:
+        raise ValueError(f"Unable to resolve slice index from record: video_path={video_path}, video_name={video_name}")
+
+    if not stage:
+        raise ValueError(f"Record is missing dataset stage: {record}")
+
+    slice_dir = f"slice_{int(slice_match.group(1)):03d}"
+    return os.path.join(roi_mask_root, stage, patient_key, slice_dir, "mask_union.png")
+
+
+def _mean_dict_values(values):
+    valid = [float(v) for v in values if np.isfinite(v)]
+    if not valid:
+        return float("nan")
+    return float(np.mean(valid))
+
+
+class RunningStats:
+    def __init__(self, dim):
+        self.dim = int(dim)
+        self.count = 0
+        self.sum = np.zeros(self.dim, dtype=np.float64)
+        self.sum_outer = np.zeros((self.dim, self.dim), dtype=np.float64)
+
+    def update(self, features):
+        feats = np.asarray(features, dtype=np.float64)
+        if feats.ndim != 2 or feats.shape[1] != self.dim:
+            raise ValueError(f"Expected features with shape [N, {self.dim}], got {feats.shape}")
+        if feats.shape[0] == 0:
+            return
+        self.count += int(feats.shape[0])
+        self.sum += feats.sum(axis=0)
+        self.sum_outer += feats.T @ feats
+
+    def mean_and_cov(self):
+        if self.count <= 0:
+            return None, None
+        mean = self.sum / float(self.count)
+        if self.count == 1:
+            cov = np.zeros((self.dim, self.dim), dtype=np.float64)
+        else:
+            centered_outer = self.sum_outer - self.count * np.outer(mean, mean)
+            cov = centered_outer / float(self.count - 1)
+        return mean, cov
+
+
+def _frechet_distance_from_stats(real_stats, pred_stats):
+    if real_stats is None or pred_stats is None or real_stats.count == 0 or pred_stats.count == 0:
+        return float("nan")
+
+    mu_real, cov_real = real_stats.mean_and_cov()
+    mu_pred, cov_pred = pred_stats.mean_and_cov()
+    if mu_real is None or mu_pred is None:
+        return float("nan")
+
+    diff = mu_real - mu_pred
+    cov_prod = cov_real @ cov_pred
+    covmean, _ = linalg.sqrtm(cov_prod, disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = diff.dot(diff) + np.trace(cov_real + cov_pred - 2.0 * covmean)
+    return float(max(fid, 0.0))
+
+
+class LPIPSEvaluator:
+    def __init__(self, device):
+        try:
+            import lpips
+        except ImportError as exc:
+            raise RuntimeError(
+                "LPIPS requires the `lpips` package. Install it in the eval environment first."
+            ) from exc
+
+        self.device = device
+        self.model = lpips.LPIPS(net="vgg").to(device)
+        self.model.eval()
+
+    def __call__(self, pred_batch, gt_batch):
+        pred_batch = pred_batch.to(self.device, non_blocking=True)
+        gt_batch = gt_batch.to(self.device, non_blocking=True)
+        if min(pred_batch.shape[-2:]) < 64:
+            pred_batch = F.interpolate(pred_batch, size=(224, 224), mode="bilinear", align_corners=False)
+            gt_batch = F.interpolate(gt_batch, size=(224, 224), mode="bilinear", align_corners=False)
+        with torch.no_grad():
+            values = self.model(pred_batch, gt_batch)
+        return values.flatten().detach().cpu().numpy().astype(np.float64)
+
+
+class FIDFeatureExtractor:
+    def __init__(self, device):
+        try:
+            from torchvision.models import Inception_V3_Weights, inception_v3
+        except ImportError as exc:
+            raise RuntimeError("FID requires torchvision with InceptionV3 available.") from exc
+
+        self.device = device
+        try:
+            self.model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False)
+        except Exception as exc:
+            raise RuntimeError(
+                "FID requires pretrained InceptionV3 weights. Cache/download them in the eval environment first."
+            ) from exc
+        self.model.fc = torch.nn.Identity()
+        self.model.eval()
+        self.model.to(device)
+        self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        self.feature_dim = 2048
+
+    def __call__(self, image_batch):
+        image_batch = image_batch.to(self.device, non_blocking=True)
+        image_batch = torch.clamp(image_batch * 0.5 + 0.5, 0.0, 1.0)
+        image_batch = F.interpolate(image_batch, size=(299, 299), mode="bilinear", align_corners=False)
+        image_batch = (image_batch - self.mean) / self.std
+        with torch.no_grad():
+            feats = self.model(image_batch)
+        if isinstance(feats, tuple):
+            feats = feats[0]
+        return feats.detach().cpu().numpy().astype(np.float64)
+
+
+def _init_perceptual_metric_totals():
+    return {
+        "lpips_sum": 0.0,
+        "lpips_count": 0.0,
+    }
+
+
+def _update_lpips_metric_totals(metric_totals, mode_names, lpips_values):
+    if lpips_values is None:
+        return
+    for mode_name, lpips_value in zip(mode_names, lpips_values):
+        if lpips_value is None or not np.isfinite(lpips_value):
+            continue
+        totals = metric_totals.setdefault(mode_name, _init_perceptual_metric_totals())
+        totals["lpips_sum"] += float(lpips_value)
+        totals["lpips_count"] += 1.0
+
+
+def _update_fid_stats(fid_stats_by_mode, mode_names, gt_features, pred_features):
+    for mode_name, gt_feat, pred_feat in zip(mode_names, gt_features, pred_features):
+        stats_entry = fid_stats_by_mode.setdefault(
+            mode_name,
+            {
+                "real": RunningStats(gt_features.shape[1]),
+                "pred": RunningStats(pred_features.shape[1]),
+            },
+        )
+        stats_entry["real"].update(gt_feat[None, :])
+        stats_entry["pred"].update(pred_feat[None, :])
+
+
+def _merge_perceptual_metrics_into_summary(summary, perceptual_metric_totals, fid_stats_by_mode):
+    macro_lpips = []
+    weighted_lpips_sum = 0.0
+    weighted_lpips_count = 0.0
+
+    for mode_name in summary["modes"].keys():
+        totals = perceptual_metric_totals.get(mode_name, _init_perceptual_metric_totals())
+        lpips_count = max(0.0, float(totals["lpips_count"]))
+        lpips_value = totals["lpips_sum"] / lpips_count if lpips_count > 0 else float("nan")
+        if lpips_count > 0:
+            macro_lpips.append(lpips_value)
+            weighted_lpips_sum += totals["lpips_sum"]
+            weighted_lpips_count += lpips_count
+
+        fid_stats = fid_stats_by_mode.get(mode_name)
+        fid_value = _frechet_distance_from_stats(fid_stats["real"], fid_stats["pred"]) if fid_stats else float("nan")
+
+        summary["modes"][mode_name]["lpips"] = lpips_value
+        summary["modes"][mode_name]["fid"] = fid_value
+
+    overall = summary["overall"]
+    overall["macro_lpips"] = _mean_dict_values(macro_lpips)
+    overall["weighted_lpips"] = weighted_lpips_sum / weighted_lpips_count if weighted_lpips_count > 0 else float("nan")
+    overall["fid"] = _frechet_distance_from_stats(
+        fid_stats_by_mode.get("__overall__", {}).get("real"),
+        fid_stats_by_mode.get("__overall__", {}).get("pred"),
+    )
+
+
+def _collapse_single_mode_summary(summary):
+    mode_names = sorted(summary["modes"].keys())
+    if len(mode_names) != 1:
+        raise ValueError(
+            f"Offline mask-pred eval expects exactly one mode per input dir, found {mode_names}. "
+            "Run eval on a single-mode export directory."
+        )
+
+    mode_name = mode_names[0]
+    mode_summary = dict(summary["modes"][mode_name])
+    plain_overall = {
+        "mode_name": mode_name,
+        "mae": mode_summary.get("mae", float("nan")),
+        "mse": mode_summary.get("mse", float("nan")),
+        "psnr": mode_summary.get("psnr", float("nan")),
+        "ssim": mode_summary.get("ssim", float("nan")),
+        "metric": mode_summary.get("metric", float("nan")),
+        "count": mode_summary.get("count", float("nan")),
+        "video_count": mode_summary.get("video_count", float("nan")),
+        "masked_frame_count": summary["overall"].get("masked_frame_count", float("nan")),
+        "mode_count": 1,
+    }
+
+    if "lpips" in mode_summary:
+        plain_overall["lpips"] = mode_summary.get("lpips", float("nan"))
+    if "fid" in mode_summary:
+        plain_overall["fid"] = mode_summary.get("fid", float("nan"))
+
+    summary["overall"] = plain_overall
+    summary["summary_layout"] = "single_mode_flat"
+    return summary
 
 
 def _find_neighbor_indices(visible_indices, target_idx):
@@ -911,6 +1163,58 @@ def run_eval(args):
 
     metric_totals = {}
     record_count = 0
+    roi_mask_enabled = bool(args.roi_mask_root)
+    perceptual_metric_totals = {}
+    fid_stats_by_mode = {}
+    perceptual_pred_buffer = []
+    perceptual_gt_buffer = []
+    perceptual_mode_buffer = []
+    perceptual_buffer_count = 0
+    lpips_evaluator = None
+    fid_extractor = None
+    metric_warnings = []
+    perceptual_batch_size = max(1, int(getattr(args, "perceptual_batch_size", 32)))
+    perceptual_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        lpips_evaluator = LPIPSEvaluator(perceptual_device)
+    except RuntimeError as exc:
+        metric_warnings.append(str(exc))
+    try:
+        fid_extractor = FIDFeatureExtractor(perceptual_device)
+    except RuntimeError as exc:
+        metric_warnings.append(str(exc))
+    if fid_extractor is not None:
+        fid_stats_by_mode["__overall__"] = {
+            "real": RunningStats(fid_extractor.feature_dim),
+            "pred": RunningStats(fid_extractor.feature_dim),
+        }
+
+    def flush_perceptual_metric_buffer():
+        nonlocal perceptual_pred_buffer, perceptual_gt_buffer, perceptual_mode_buffer, perceptual_buffer_count
+        if not perceptual_pred_buffer:
+            return
+
+        pred_batch = torch.cat(perceptual_pred_buffer, dim=0)
+        gt_batch = torch.cat(perceptual_gt_buffer, dim=0)
+        lpips_values = lpips_evaluator(pred_batch, gt_batch).tolist() if lpips_evaluator is not None else None
+        _update_lpips_metric_totals(
+            perceptual_metric_totals,
+            perceptual_mode_buffer,
+            lpips_values,
+        )
+
+        if fid_extractor is not None:
+            pred_features = fid_extractor(pred_batch)
+            gt_features = fid_extractor(gt_batch)
+            _update_fid_stats(fid_stats_by_mode, perceptual_mode_buffer, gt_features, pred_features)
+            fid_stats_by_mode["__overall__"]["real"].update(gt_features)
+            fid_stats_by_mode["__overall__"]["pred"].update(pred_features)
+
+        perceptual_pred_buffer = []
+        perceptual_gt_buffer = []
+        perceptual_mode_buffer = []
+        perceptual_buffer_count = 0
+
     progress = create_rich_progress()
     progress.start()
     eval_task = progress.add_task("mask_pred eval", total=len(prediction_files), completed=0, status="records 0")
@@ -940,24 +1244,57 @@ def run_eval(args):
             if target_count <= 0:
                 progress.update(eval_task, advance=1, status=f"records {record_count}")
                 continue
+
+            spatial_mask = None
+            roi_mask_path = None
+            if roi_mask_enabled:
+                roi_mask_path = _resolve_record_roi_mask_path(record, args.roi_mask_root)
+                if not os.path.exists(roi_mask_path):
+                    raise FileNotFoundError(f"ROI mask not found for record {prediction_path}: {roi_mask_path}")
+                roi_mask_np = _load_union_roi_mask(roi_mask_path)
+                spatial_mask = torch.from_numpy(roi_mask_np.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+
             ones_mask = torch.ones(1, target_count, dtype=torch.float32)
             batch_metrics = compute_masked_frame_metrics(
                 pred_video=pred_targets.unsqueeze(0),
                 gt_video=gt_targets.unsqueeze(0),
                 frame_mask=ones_mask,
                 valid_mask=ones_mask,
+                spatial_mask=spatial_mask,
             )
             for key, value in batch_metrics.items():
                 metric_totals[mode_name][key] += value
+
+            perceptual_pred_buffer.append(pred_targets)
+            perceptual_gt_buffer.append(gt_targets)
+            perceptual_mode_buffer.extend([mode_name] * pred_targets.shape[0])
+            perceptual_buffer_count += int(pred_targets.shape[0])
+            if perceptual_buffer_count >= perceptual_batch_size:
+                flush_perceptual_metric_buffer()
+
             record_count += 1
             progress.update(eval_task, advance=1, status=f"records {record_count}")
     finally:
+        flush_perceptual_metric_buffer()
         progress.stop()
 
     summary = summarize_validation_metrics(metric_totals)
+    _merge_perceptual_metrics_into_summary(summary, perceptual_metric_totals, fid_stats_by_mode)
+    summary = _collapse_single_mode_summary(summary)
     summary["task"] = "mask_pred"
     summary["input_dir"] = args.input_dir
     summary["records"] = record_count
+    summary["metric_scope"] = {
+        "roi_mask_enabled": roi_mask_enabled,
+        "roi_mask_root": args.roi_mask_root,
+        "pixel_metrics": "union-mask ROI only" if roi_mask_enabled else "full frame",
+        "ssim": "full frame",
+        "lpips": "full frame",
+        "fid": "full frame",
+        "psnr_definition": "dataset-level PSNR from summary MSE: 10 * log10((data_range^2) / mse)",
+    }
+    if metric_warnings:
+        summary["metric_warnings"] = metric_warnings
 
     output_dir = args.output_dir or args.input_dir
     summary_path = os.path.join(output_dir, "eval_summary.json")
@@ -967,11 +1304,18 @@ def run_eval(args):
     print("Mask-pred offline eval summary")
     print(f"input_dir: {args.input_dir}")
     print(f"records: {record_count}")
-    print(f"macro_metric: {overall['macro_metric']:.6f}")
-    print(f"weighted_mae: {overall['weighted_mae']:.6f}")
-    print(f"weighted_mse: {overall['weighted_mse']:.6f}")
-    print(f"weighted_psnr: {overall['weighted_psnr']:.4f}")
-    print(f"weighted_ssim: {overall['weighted_ssim']:.4f}")
+    print(f"pixel_metrics: {summary['metric_scope']['pixel_metrics']}")
+    print(f"ssim: {summary['metric_scope']['ssim']}")
+    print(f"mode_name: {overall['mode_name']}")
+    print(f"metric: {overall['metric']:.6f}")
+    print(f"mae: {overall['mae']:.6f}")
+    print(f"mse: {overall['mse']:.6f}")
+    print(f"psnr: {overall['psnr']:.4f}")
+    print(f"ssim: {overall['ssim']:.4f}")
+    print(f"lpips: {overall.get('lpips', float('nan')):.4f}")
+    print(f"fid: {overall.get('fid', float('nan')):.4f}")
+    for warning in metric_warnings:
+        print(f"warning: {warning}")
     print(f"summary: {summary_path}")
 
 

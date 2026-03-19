@@ -230,7 +230,7 @@ Validation split with the current default-style protocol:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage val --mask-mode single_mid --output-dir results/eval/mask_pred/reconstruct/val/model_single_mid
-python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/val/model_single_mid
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/val/model_single_mid --roi-mask-root data/TSSC_stage1_masks_output_2D
 python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/val/model_single_mid --output-dir results/eval/mask_pred/reconstruct/val/model_single_mid_figures
 ```
 
@@ -238,7 +238,7 @@ Test split with a specific saved checkpoint:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --ckpt best_mask_pred.pth --output-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_single_all
-python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_single_all --roi-mask-root data/TSSC_stage1_masks_output_2D
 python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_single_all --output-dir results/eval/mask_pred/reconstruct/test/best_mask_pred_single_all_figures
 ```
 
@@ -264,7 +264,7 @@ Nearest-frame baseline:
 
 ```bash
 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --baseline-method nearest --output-dir results/eval/mask_pred/reconstruct/test/baseline_nearest_single_all
-python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_nearest_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_nearest_single_all --roi-mask-root data/TSSC_stage1_masks_output_2D
 python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_nearest_single_all --output-dir results/eval/mask_pred/reconstruct/test/baseline_nearest_single_all_figures
 ```
 
@@ -272,7 +272,7 @@ Linear baseline:
 
 ```bash
 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --baseline-method linear --output-dir results/eval/mask_pred/reconstruct/test/baseline_linear_single_all
-python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_linear_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_linear_single_all --roi-mask-root data/TSSC_stage1_masks_output_2D
 python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_linear_single_all --output-dir results/eval/mask_pred/reconstruct/test/baseline_linear_single_all_figures
 ```
 
@@ -280,7 +280,7 @@ Single-direction DIS flow baseline:
 
 ```bash
 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --baseline-method si_dis_flow --output-dir results/eval/mask_pred/reconstruct/test/baseline_si_dis_flow_single_all
-python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_si_dis_flow_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_si_dis_flow_single_all --roi-mask-root data/TSSC_stage1_masks_output_2D
 python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_si_dis_flow_single_all --output-dir results/eval/mask_pred/reconstruct/test/baseline_si_dis_flow_single_all_figures
 ```
 
@@ -288,7 +288,7 @@ Bidirectional DIS flow baseline:
 
 ```bash
 python test.py infer --task mask_pred --config configs/config_mask_pred.yaml --mode reconstruct --stage test --mask-mode single_all --baseline-method bi_dis_flow --output-dir results/eval/mask_pred/reconstruct/test/baseline_bi_dis_flow_single_all
-python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_bi_dis_flow_single_all
+python test.py eval --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_bi_dis_flow_single_all --roi-mask-root data/TSSC_stage1_masks_output_2D
 python test.py visualize --task mask_pred --input-dir results/eval/mask_pred/reconstruct/test/baseline_bi_dis_flow_single_all --output-dir results/eval/mask_pred/reconstruct/test/baseline_bi_dis_flow_single_all_figures
 ```
 
@@ -310,6 +310,7 @@ Notes:
 
 - `reconstruct` is the main quantitative testing path for mask-pred.
 - `eval` and `visualize` both consume the saved `.pt` outputs from `infer`; neither reruns inference.
+- `eval` commands above use `--roi-mask-root data/TSSC_stage1_masks_output_2D`, so `MAE/MSE/PSNR` are computed inside the union vessel ROI, while `SSIM/LPIPS/FID` are computed on the full frame.
 - `visualize` writes one overview figure per slice and aggregates all saved targets for that slice.
 - `--stage val` uses the same deterministic train/val split as mask-pred training.
 - `--stage test` reads `data_path_test`.

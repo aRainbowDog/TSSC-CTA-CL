@@ -166,10 +166,50 @@ def decode_latent_sequence(vae, latent_sequence, use_amp=True, decode_batch_size
     return decoded.reshape(batch_size, sequence_length, *decoded.shape[1:])
 
 
-def compute_masked_frame_metrics(pred_video, gt_video, frame_mask, valid_mask):
+def _mse_to_psnr(mse, data_range=2.0):
+    mse = float(mse)
+    if mse <= 0.0:
+        return float("inf")
+    return float(10.0 * np.log10((float(data_range) ** 2) / mse))
+
+
+def _prepare_spatial_mask(spatial_mask, target_shape):
+    if spatial_mask is None:
+        return None
+
+    mask = spatial_mask.detach().cpu().numpy()
+    if mask.ndim == 2:
+        mask = mask[None, None, :, :]
+    elif mask.ndim == 3:
+        mask = mask[:, None, :, :]
+    elif mask.ndim == 4:
+        pass
+    elif mask.ndim == 5 and mask.shape[2] == 1:
+        mask = mask[:, :, 0, :, :]
+    else:
+        raise ValueError(f"Unsupported spatial_mask shape: {tuple(spatial_mask.shape)}")
+
+    batch_size, frame_count, height, width = target_shape
+    if mask.shape[-2:] != (height, width):
+        raise ValueError(
+            f"spatial_mask spatial size must be {(height, width)}, got {tuple(mask.shape[-2:])}"
+        )
+    if mask.shape[0] == 1 and batch_size > 1:
+        mask = np.repeat(mask, batch_size, axis=0)
+    if mask.shape[1] == 1 and frame_count > 1:
+        mask = np.repeat(mask, frame_count, axis=1)
+    if mask.shape[:2] != (batch_size, frame_count):
+        raise ValueError(
+            f"spatial_mask batch/time dims must broadcast to {(batch_size, frame_count)}, got {tuple(mask.shape[:2])}"
+        )
+    return mask > 0.5
+
+
+def compute_masked_frame_metrics(pred_video, gt_video, frame_mask, valid_mask, spatial_mask=None):
     pred_np = pred_video.detach().cpu().numpy()
     gt_np = gt_video.detach().cpu().numpy()
     active_mask = ((frame_mask > 0.5) & (valid_mask > 0.5)).detach().cpu().numpy()
+    spatial_mask_np = _prepare_spatial_mask(spatial_mask, active_mask.shape + pred_np.shape[-2:])
 
     metrics = {
         "mae_sum": 0.0,
@@ -183,18 +223,35 @@ def compute_masked_frame_metrics(pred_video, gt_video, frame_mask, valid_mask):
         masked_indices = np.where(active_mask[batch_idx])[0]
         if masked_indices.size == 0:
             continue
-        metrics["video_count"] += 1.0
+        contributed = False
         for frame_idx in masked_indices:
             pred_frame = pred_np[batch_idx, frame_idx]
             gt_frame = gt_np[batch_idx, frame_idx]
             diff = pred_frame - gt_frame
-            metrics["mae_sum"] += float(np.abs(diff).mean())
-            metrics["mse_sum"] += float(np.square(diff).mean())
-            metrics["psnr_sum"] += float(peak_signal_noise_ratio(gt_frame, pred_frame, data_range=2.0))
+
+            if spatial_mask_np is not None:
+                roi = spatial_mask_np[batch_idx, frame_idx]
+                if not np.any(roi):
+                    continue
+                diff_roi = diff[:, roi]
+                frame_mae = float(np.abs(diff_roi).mean())
+                frame_mse = float(np.square(diff_roi).mean())
+                frame_psnr = _mse_to_psnr(frame_mse, data_range=2.0)
+            else:
+                frame_mae = float(np.abs(diff).mean())
+                frame_mse = float(np.square(diff).mean())
+                frame_psnr = float(peak_signal_noise_ratio(gt_frame, pred_frame, data_range=2.0))
+
+            contributed = True
+            metrics["mae_sum"] += frame_mae
+            metrics["mse_sum"] += frame_mse
+            metrics["psnr_sum"] += frame_psnr
             pred_gray = pred_frame.mean(axis=0)
             gt_gray = gt_frame.mean(axis=0)
             metrics["ssim_sum"] += float(structural_similarity(gt_gray, pred_gray, data_range=2.0))
             metrics["count"] += 1.0
+        if contributed:
+            metrics["video_count"] += 1.0
     return metrics
 
 
@@ -242,7 +299,6 @@ def summarize_validation_metrics(metric_totals):
     macro_metric = []
     weighted_mae_sum = 0.0
     weighted_mse_sum = 0.0
-    weighted_psnr_sum = 0.0
     weighted_ssim_sum = 0.0
     weighted_count = 0.0
 
@@ -251,7 +307,7 @@ def summarize_validation_metrics(metric_totals):
         if count > 0:
             mae = totals["mae_sum"] / count
             mse = totals["mse_sum"] / count
-            psnr = totals["psnr_sum"] / count
+            psnr = _mse_to_psnr(mse, data_range=2.0)
             ssim = totals["ssim_sum"] / count
             metric = (mae + mse) / 2.0
             macro_mae.append(mae)
@@ -261,7 +317,6 @@ def summarize_validation_metrics(metric_totals):
             macro_metric.append(metric)
             weighted_mae_sum += totals["mae_sum"]
             weighted_mse_sum += totals["mse_sum"]
-            weighted_psnr_sum += totals["psnr_sum"]
             weighted_ssim_sum += totals["ssim_sum"]
             weighted_count += count
         else:
@@ -288,7 +343,7 @@ def summarize_validation_metrics(metric_totals):
         "macro_metric": float(np.mean(macro_metric)) if macro_metric else float("inf"),
         "weighted_mae": weighted_mae_sum / weighted_count if weighted_count > 0 else float("nan"),
         "weighted_mse": weighted_mse_sum / weighted_count if weighted_count > 0 else float("nan"),
-        "weighted_psnr": weighted_psnr_sum / weighted_count if weighted_count > 0 else float("nan"),
+        "weighted_psnr": _mse_to_psnr(weighted_mse_sum / weighted_count, data_range=2.0) if weighted_count > 0 else float("nan"),
         "weighted_ssim": weighted_ssim_sum / weighted_count if weighted_count > 0 else float("nan"),
         "masked_frame_count": weighted_count,
         "mode_count": len(macro_metric),
