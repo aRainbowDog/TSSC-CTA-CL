@@ -386,6 +386,7 @@ class GaussianDiffusion:
             min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
             max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
             # The model_var_values is [-1, 1] for [min_var, max_var].
+            model_var_values = model_var_values.clamp(-1.0, 1.0)
             frac = (model_var_values + 1) / 2
             model_log_variance = frac * max_log + (1 - frac) * min_log
             model_variance = th.exp(model_log_variance)

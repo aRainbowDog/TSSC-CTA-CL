@@ -48,6 +48,7 @@ ema_warmup_steps: 16000
 vae_encode_batch_size: 4
 vae_decode_batch_size: 8
 ddp_timeout_minutes: 180
+max_consecutive_nonfinite_steps: 4
 cuda_empty_cache_interval: 1600
 val_interval: 10
 val_max_batches: 0

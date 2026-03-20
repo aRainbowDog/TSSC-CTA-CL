@@ -139,6 +139,8 @@ def compute_masked_sequence_loss(
                 f"Expected model output channels {channels * 2} for learned sigma, got {model_output.shape[2]}"
             )
         model_output, model_var_values = torch.split(model_output, channels, dim=2)
+        if diffusion.model_var_type == ModelVarType.LEARNED_RANGE:
+            model_var_values = model_var_values.clamp(-1.0, 1.0)
         frozen_out = torch.cat([model_output.detach(), model_var_values], dim=2).permute(0, 2, 1, 3, 4)
         vb_loss = diffusion._vb_terms_bpd(
             model=lambda *args, r=frozen_out: r,
@@ -165,12 +167,15 @@ def compute_masked_sequence_loss(
     if weight_batch is not None:
         weight_batch = align_weight_batch(weight_batch, batch_size, pred.shape[2], pred.shape[3], pred.shape[4])
         weight_mean = weight_batch.mean()
+        if not torch.isfinite(weight_mean) or weight_mean.item() <= 0:
+            return masked_loss.sum() * float("nan")
         weight_5d = weight_batch[:, None, :, :, :]
         masked_loss = masked_loss * weight_5d * (1.0 / weight_mean)
-    denom = mask_5d.sum() * pred.shape[2] * pred.shape[3] * pred.shape[4]
-    if denom.item() <= 0:
+    if mask_5d.sum().item() <= 0:
         raise ValueError("Frame mask produced zero masked elements")
-    total_loss = masked_loss.sum() / denom
+    # Normalize over the full sequence tensor so loss scale does not explode
+    # when only a small number of frames are masked.
+    total_loss = masked_loss.sum() / pred.numel()
     if vb_loss is not None:
         total_loss = total_loss + vb_loss
     return total_loss

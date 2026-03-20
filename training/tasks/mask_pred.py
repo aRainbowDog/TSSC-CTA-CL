@@ -7,6 +7,7 @@ from copy import deepcopy
 from time import time
 
 import torch
+import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 from diffusers.optimization import get_scheduler
 from omegaconf import OmegaConf
@@ -57,6 +58,13 @@ from utils.utils import (
 )
 
 warnings.filterwarnings("ignore")
+
+
+def sync_any_rank_true(local_flag, device):
+    flag = torch.tensor(1 if local_flag else 0, dtype=torch.int32, device=device)
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
 
 
 def build_parser(default_config="configs/config_mask_pred.yaml"):
@@ -626,6 +634,8 @@ def main(args):
     running_masked_frames = 0.0
     log_steps = 0
     start_time = time()
+    consecutive_nonfinite_steps = 0
+    max_consecutive_nonfinite_steps = max(1, int(getattr(args, "max_consecutive_nonfinite_steps", 4)))
     last_saved_epoch_label = first_epoch
     last_saved_epoch_index = first_epoch
     last_saved_batch_in_epoch = resume_step
@@ -665,7 +675,21 @@ def main(args):
                 )
                 latent = latent.reshape(batch_size, sequence_length, *latent.shape[1:])
 
+            has_nonfinite_inputs = (
+                not bool(torch.isfinite(frame_times).all().item())
+                or not bool(torch.isfinite(latent).all().item())
+            )
+            if sync_any_rank_true(has_nonfinite_inputs, device):
+                raise FloatingPointError(
+                    f"Encountered non-finite frame_times or VAE latents at epoch {epoch + 1}, batch {step + 1}."
+                )
+
             frame_mask = sample_frame_mask_batch(valid_mask, args.mask_prediction, device=device)
+            if sync_any_rank_true(float(frame_mask.sum().item()) <= 0.0, device):
+                raise ValueError(
+                    f"Encountered an empty frame mask at epoch {epoch + 1}, batch {step + 1}. "
+                    "Check sequence lengths and mask sampling constraints."
+                )
             weight_batch = build_vessel_weight_batch(
                 video=video,
                 valid_mask=valid_mask,
@@ -693,8 +717,27 @@ def main(args):
                         loss_target_mode=str(args.mask_prediction.get("loss_target_mode", "auto")),
                         weight_batch=weight_batch,
                     )
+                has_nonfinite_loss = not bool(torch.isfinite(loss.detach()).all().item())
+                if not has_nonfinite_loss:
                     loss_to_backward = loss / accum_divisor
                     scaler.scale(loss_to_backward).backward()
+                else:
+                    loss_to_backward = None
+
+            if sync_any_rank_true(has_nonfinite_loss, device):
+                consecutive_nonfinite_steps += 1
+                set_optimizer_zeros_grad(opt)
+                if rank == 0:
+                    logger.warning(
+                        f"Skipping non-finite loss at epoch {epoch + 1}, batch {step + 1}, "
+                        f"opt step {train_steps} | consecutive skips {consecutive_nonfinite_steps}/"
+                        f"{max_consecutive_nonfinite_steps}"
+                    )
+                if consecutive_nonfinite_steps >= max_consecutive_nonfinite_steps:
+                    raise FloatingPointError(
+                        f"Aborting after {consecutive_nonfinite_steps} consecutive non-finite losses."
+                    )
+                continue
 
             if should_step:
                 if args.mixed_precision:
@@ -704,11 +747,30 @@ def main(args):
                     args.clip_max_norm,
                     clip_grad=(train_steps >= args.start_clip_iter),
                 )
+                has_nonfinite_grad = not bool(torch.isfinite(grad_norm.detach()).all().item())
+                if sync_any_rank_true(has_nonfinite_grad, device):
+                    consecutive_nonfinite_steps += 1
+                    if args.mixed_precision:
+                        scaler.step(opt)
+                        scaler.update()
+                    set_optimizer_zeros_grad(opt)
+                    if rank == 0:
+                        logger.warning(
+                            f"Skipping non-finite gradients at epoch {epoch + 1}, batch {step + 1}, "
+                            f"opt step {train_steps} | consecutive skips {consecutive_nonfinite_steps}/"
+                            f"{max_consecutive_nonfinite_steps}"
+                        )
+                    if consecutive_nonfinite_steps >= max_consecutive_nonfinite_steps:
+                        raise FloatingPointError(
+                            f"Aborting after {consecutive_nonfinite_steps} consecutive non-finite gradient steps."
+                        )
+                    continue
                 scaler.step(opt)
                 scaler.update()
                 lr_scheduler.step()
                 set_optimizer_zeros_grad(opt)
                 train_steps += 1
+                consecutive_nonfinite_steps = 0
 
                 ema_decay = get_ema_decay(
                     train_steps,
